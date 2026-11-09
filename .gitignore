@@ -1,0 +1,9 @@
+/dist/
+/node_modules/
+/vendor/node_modules/
+/vendor/mcp-src/node_modules/
+*.sqlite*
+*.db
+*.key
+.env*
+/packaging/app.tar*

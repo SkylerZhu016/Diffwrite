@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Diffwrite · 逐句审稿</title>
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="app.mjs"></script>
+</head>
+<body data-empty="true">
+  <header class="toolbar">
+    <div class="brand"><span class="brand-mark" aria-hidden="true">“</span><div><strong>Diffwrite</strong><small>本地写作审稿</small></div></div>
+    <div class="actions">
+      <button id="paste" class="primary">粘贴文本</button>
+      <button id="import">导入文件</button>
+      <input id="file" type="file" accept=".txt,.md,.docx,.json" hidden>
+      <details id="export-menu"><summary id="export-toggle">导出 <span aria-hidden="true">▾</span></summary>
+        <div class="menu">
+          <button id="export-text">导出修改版</button>
+          <button id="copy-text">复制为修改版</button>
+          <button id="export-diff">导出带注原文（Diff）</button>
+          <button id="copy-diff">复制为带注原文（Diff）</button>
+          <button id="copy-changes">仅复制改动与意见</button>
+        </div>
+      </details>
+      <button id="export-backup" hidden>审稿备份</button>
+      <button id="notify-ai" hidden>保存并通知 AI</button>
+      <button id="ai-inbox" hidden>AI 来稿</button>
+      <button id="mcp-open">MCP 连接</button>
+      <details id="history-menu">
+        <summary id="history-toggle">历史记录 <span aria-hidden="true">▾</span></summary>
+        <div class="history-popover">
+          <div class="history-header"><h2>审稿历史</h2><button id="new-draft">新建空白</button></div>
+          <div class="history-filters" aria-label="历史记录筛选"><button id="history-live" aria-pressed="true">全部</button><button id="history-trash" aria-pressed="false">已删除</button><button id="history-empty-trash" hidden>清空回收站</button></div>
+          <p id="history-state" role="status">正在读取…</p>
+          <ul id="history-list" aria-label="历史稿件"></ul>
+        </div>
+      </details>
+    </div>
+  </header>
+  <p id="output-state" class="toast" role="status" hidden></p>
+  <main class="workspace">
+    <section id="reading-pane" class="reading" aria-labelledby="draft-name">
+      <div class="reading-head">
+        <div class="manuscript"><span>稿件</span><h1 id="draft-name">未导入稿件</h1></div>
+        <div class="reading-tools">
+        <div class="modes" role="tablist" aria-label="正文视图">
+          <button id="tab-source" data-mode="source" role="tab" aria-controls="reading-body" aria-selected="false" tabindex="-1">原文</button>
+          <button id="tab-split" data-mode="split" role="tab" aria-controls="reading-body" aria-selected="true">分句模式</button>
+        </div>
+
+        <div id="changes-controls" class="change-controls" hidden>
+          <label class="change-switch" title="分句模式中可切换；关闭后只看当前改稿">
+            <input id="show-changes" type="checkbox" role="switch" checked>
+            <span>显示变更</span>
+          </label>
+          <details id="change-options">
+            <summary><span id="change-level">仅高亮改动</span><span aria-hidden="true">▾</span></summary>
+            <fieldset class="change-menu">
+              <legend class="sr-only">变更详细程度</legend>
+              <label><input type="radio" name="change-detail" value="inline" checked><span><strong>仅高亮改动</strong><small>标出改后的字，隐藏删去的文字</small></span></label>
+              <label><input type="radio" name="change-detail" value="full"><span><strong>显示新增和删除</strong><small>新增高亮，删去的字带删除线</small></span></label>
+              <label><input type="radio" name="change-detail" value="sentence"><span><strong>按句标记</strong><small>用淡绿和淡紫区分未改、已改</small></span></label>
+            </fieldset>
+          </details>
+        </div>
+        <button id="markdown-view" hidden>渲染 Markdown</button>
+        <button id="delete-selection" hidden disabled>删除选中</button>
+        <button id="undo-delete" hidden disabled>撤销删除</button>
+        <button id="ai-next" hidden>AI 待审</button>
+        </div>
+      </div>
+      <p id="notice" class="notice" role="status" hidden></p>
+      <div id="reading-body" class="reading-body" role="tabpanel" aria-labelledby="tab-split">
+        <div id="empty" class="empty">
+          <h2>新稿件</h2>
+          <button id="drop-file" class="drop-file" type="button">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 16V3m-4 4 4-4 4 4M5 13v6a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-6"/></svg>
+            <strong>拖入文件，或点击选择</strong>
+            <small>TXT、Markdown、Word 或审稿备份</small>
+          </button>
+          <p>也可以粘贴文本，或从右上角打开历史稿件。</p>
+        </div>
+        <div id="manuscript" class="prose" hidden></div>
+      </div>
+      <div id="legend" class="reading-foot" hidden>
+        <span id="sentence-legend" class="legend-group"><span><i class="swatch"></i>未改</span><span><i class="swatch changed"></i>已改</span></span>
+        <span id="inline-legend" class="legend-group"><span><i class="legend-added"></i>新增或替换</span><span id="removed-legend"><i class="legend-removed"></i>删除</span></span>
+        <span class="foot-tip">点击一句可直接编辑</span>
+      </div>
+    </section>
+    <div id="splitter" class="splitter" role="separator" aria-label="调整左右栏宽度" aria-orientation="vertical" aria-controls="reading-pane" tabindex="0" title="拖动调整；双击恢复 60/40"></div>
+    <aside class="review" aria-labelledby="review-title">
+      <div class="review-head">
+        <h2 id="review-title">本句审稿</h2>
+        <div class="save-info"><span id="save-state" role="status"></span><button id="retry" class="text-action" hidden>重试</button></div>
+      </div>
+      <div class="review-body">
+        <p id="hint" class="hint">点击左侧正文直接编辑。</p>
+        <div id="editor" hidden>
+          <div class="quote-label"><span id="quote-caption">原句</span><span id="change-state" class="badge"></span><button id="delete-sentence">删除本句</button></div>
+          <blockquote id="quote"></blockquote>
+          <div id="fields" class="fields">
+            <div id="opinion-field" class="field">
+              <div class="opinion-head"><label for="opinion">意见栏</label><div class="opinion-controls">
+                <button id="opinion-settings-open" class="text-action" type="button">设置</button>
+                <label class="opinion-switch"><input type="checkbox" id="opinion-enabled" autocomplete="off"> AI 补全</label>
+              </div></div>
+              <textarea id="opinion" rows="4" placeholder="这句哪里需要调整？"></textarea>
+              <div class="opinion-tools"><button id="opinion-suggest" class="text-action" type="button" hidden>给个建议</button><span id="opinion-status" role="status" hidden></span></div>
+              <div id="opinion-card" class="opinion-card" hidden>
+                <div id="opinion-card-label" class="opinion-card-label"></div>
+                <p id="opinion-preview"></p>
+                <div class="ai-card-actions"><button id="opinion-reject" type="button">拒绝</button><button id="opinion-accept" class="primary" type="button">接受</button></div>
+              </div>
+            </div>
+            <div id="revision-field" class="field"><label for="revision">改版栏 <small id="revision-hint">留空则沿用原句</small></label>
+              <textarea id="revision" rows="5" placeholder="写下用来替换原句的文字"></textarea></div>
+          </div>
+          <section id="ai-suggestions" class="ai-suggestions" hidden><h3>AI 审稿建议</h3><div id="ai-suggestion-list"></div></section>
+        </div>
+      </div>
+    </aside>
+  </main>
+  <dialog id="paste-dialog">
+    <form id="paste-form">
+      <h2>粘贴文本</h2>
+      <label class="sr-only" for="paste-text">稿件正文</label>
+      <textarea id="paste-text" placeholder="把稿件粘贴到这里" rows="10" required></textarea>
+      <label class="paste-format"><input type="checkbox" id="paste-markdown"> 按 Markdown 显示</label>
+      <p id="paste-error" class="error" role="alert" hidden></p>
+      <div class="dialog-actions"><button type="button" data-close="paste-dialog">取消</button><button id="paste-submit" class="primary" type="submit">开始审稿</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="opinion-settings-dialog" aria-labelledby="opinion-settings-title">
+    <form id="opinion-settings-form">
+      <h2 id="opinion-settings-title">AI 补全设置</h2>
+      <p>支持 OpenAI 兼容的聊天接口。生成时只把当前句、少量相邻原文和当前意见发给此服务。反馈留在本机，手动导出才会生成文件。</p>
+      <div class="opinion-settings-fields">
+        <label>服务地址<input id="opinion-url" type="url" placeholder="http://127.0.0.1:1234/v1" maxlength="500"></label>
+        <label>模型名称<input id="opinion-model" type="text" maxlength="160" placeholder="填写服务提供的模型名称"></label>
+        <label>模型密钥 <span id="opinion-key-state"></span><input id="opinion-key" type="password" autocomplete="off" maxlength="4096" placeholder="本机服务不需要时留空"></label>
+        <label id="opinion-clear-key-row" class="opinion-clear"><input id="opinion-clear-key" type="checkbox"> 清除已保存密钥</label>
+        <label for="opinion-prompt">提示词</label>
+        <textarea id="opinion-prompt" rows="10" maxlength="12000" spellcheck="false" required></textarea>
+      </div>
+      <p id="opinion-settings-status" role="status" hidden></p>
+      <div class="dialog-actions opinion-settings-actions">
+        <button id="opinion-prompt-reset" type="button">恢复默认</button>
+        <button id="opinion-prompt-copy" type="button">复制提示词</button>
+        <button id="opinion-feedback-export" type="button">导出反馈</button>
+        <button type="button" data-close="opinion-settings-dialog">关闭</button>
+        <button id="opinion-settings-save" class="primary" type="submit">保存设置</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="mcp-dialog" aria-labelledby="mcp-title">
+    <h2 id="mcp-title">MCP 连接</h2>
+    <p>为每个 AI 工具建一条连接。普通连接可读稿、投稿和提交建议；只为信任的连接开启自动编辑。</p>
+    <code id="mcp-address"></code>
+    <p id="mcp-state" role="status"></p>
+    <ul id="mcp-connections" aria-label="连接列表"></ul>
+    <form id="mcp-create">
+      <label for="mcp-name">新连接名称</label>
+      <div class="mcp-create-row"><input id="mcp-name" type="text" maxlength="64" placeholder="例如：OMP 写作" required><button class="primary" type="submit">生成连接码</button></div>
+    </form>
+    <div class="dialog-actions"><button type="button" data-close="mcp-dialog">关闭</button></div>
+  </dialog>
+
+  <dialog id="notify-dialog" aria-labelledby="notify-title">
+    <form id="notify-form">
+      <h2 id="notify-title">保存并通知 AI</h2>
+      <p id="notify-description">只发送自上次通知这位收件人以来的改动和意见，不发送整篇。</p>
+      <div id="notify-target">
+        <label for="notify-recipient">收件人</label>
+        <select id="notify-recipient" required></select>
+      </div>
+      <p id="notify-status" role="status" hidden></p>
+      <div class="dialog-actions">
+        <button id="notify-cancel" type="button" data-close="notify-dialog">取消</button>
+        <button id="notify-manage" type="button" hidden>管理 MCP 连接</button>
+        <button id="notify-send" class="primary" type="submit">保存并通知</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="history-delete-dialog" aria-labelledby="history-delete-title">
+    <h2 id="history-delete-title">删除历史记录？</h2>
+    <p id="history-delete-description"></p>
+    <p id="history-delete-error" class="error" role="alert" hidden></p>
+    <div class="dialog-actions"><button id="history-delete-cancel" type="button">取消</button><button id="history-delete-confirm" class="danger" type="button">删除记录</button></div>
+  </dialog>
+</body>
+</html>

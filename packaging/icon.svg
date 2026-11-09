@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="逐句审稿">
+  <defs>
+    <linearGradient id="paper" x2="1" y2="1" gradientUnits="objectBoundingBox">
+      <stop stop-color="#496b96"/>
+      <stop offset="1" stop-color="#253d60"/>
+    </linearGradient>
+  </defs>
+  <rect x="12" y="12" width="232" height="232" rx="53" fill="url(#paper)"/>
+  <rect x="17" y="17" width="222" height="222" rx="48" fill="none" stroke="#9eb9db" stroke-opacity=".30" stroke-width="3"/>
+  <path fill="#f3f7fd" d="M111 69c-24 5-45 25-45 53 0 20 12 32 29 32 15 0 25-10 25-24 0-13-9-21-21-21-4 0-7 1-10 2 3-11 12-20 26-26z"/>
+  <path fill="#f3f7fd" d="M182 69c-24 5-45 25-45 53 0 20 12 32 29 32 15 0 25-10 25-24 0-13-9-21-21-21-4 0-7 1-10 2 3-11 12-20 26-26z"/>
+  <path d="M77 180h102" stroke="#a5c5ef" stroke-width="12" stroke-linecap="round"/>
+</svg>
