@@ -39,7 +39,7 @@ node .\packaging\build-windows.mjs
 
 > 在 Diffwrite 仓库根目录运行测试，再用打包脚本输出一个新文件名，不覆盖旧版。用独立的临时数据目录、运行时目录和空闲端口验证 EXE 能启动；只停止测试实例，不读取我的稿件库。最后给我成品路径、大小和验证结果。
 
-隔离验证可设置 `DIFFWRITE_DATA`、`DIFFWRITE_RUNTIME`、`DIFFWRITE_PORT`，以 `--no-browser` 启动并检查 `/health`；托盘菜单需要另行实测。改过 `packaging/icon.svg` 后，可用 Chrome 与 Pillow 运行 `python packaging/render-icon.py` 生成 ICO。
+隔离验证可设置 `DIFFWRITE_REVIEW_DATA`、`DIFFWRITE_REVIEW_RUNTIME`、`DIFFWRITE_REVIEW_PORT`，以 `--no-browser` 启动并检查 `/health`；托盘菜单需要另行实测。改过 `packaging/icon.svg` 后，可用 Chrome 与 Pillow 运行 `python packaging/render-icon.py` 生成 ICO。
 
 ## 许可
 
