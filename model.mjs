@@ -65,6 +65,7 @@ function spokenTag(tail) {
 }
 function interiorDot(text,i,start,end,next) {
   const before=i>start ? text[i-1] : '', after=i+1<end ? text[i+1] : '';
+  if (/[A-Za-z0-9]/u.test(after)) return true;
   if (digit.test(after) && (digit.test(before) || !before || white.test(before) || /[(（+\-]/u.test(before))) return true;
   const left=text.slice(Math.max(start,i-32),i+1).replaceAll('．','.');
   const tail=text.slice(next,Math.min(end,next+48));
@@ -183,8 +184,21 @@ export function restoreDraft(raw) {
       omittedGaps.push([a,b]);end=b;
     }
   }
+  // AI 审稿 tags. opinion: offset where the AI-written part of the opinion starts (0 = all of it);
+  // body: the current revision or deletion was written by AI; replaced: the author's own
+  // revision that an AI overwrote on request, kept so the author can switch back.
   const aiMarks={};
-  for(const [i,rev] of Object.entries(raw.aiMarks??{}))if(/^(0|[1-9]\d*)$/.test(i)&&Number(i)<raw.spans.length&&Number.isSafeInteger(rev)&&rev>0)aiMarks[i]=rev;
+  for(const [i,mark] of Object.entries(raw.aiMarks??{})){
+    if(!/^(0|[1-9]\d*)$/.test(i)||Number(i)>=raw.spans.length||!mark||typeof mark!=='object')continue;
+    const kept={}, replaced=mark.replaced;
+    if(Number.isSafeInteger(mark.opinion)&&mark.opinion>=0&&mark.opinion<(notes[i]?.opinion.length??0))kept.opinion=mark.opinion;
+    if(mark.body===true){
+      kept.body=true;
+      if(replaced&&typeof replaced.revision==='string')
+        kept.replaced={revision:replaced.revision,...(replaced.deleted===true?{deleted:true}:{})};
+    }
+    if(Object.keys(kept).length)aiMarks[i]=kept;
+  }
   const notices = Array.isArray(raw.notices) ? raw.notices.filter(x => typeof x === 'string') : [];
   return {version:1, name:raw.name, source:raw.source, spans:raw.spans, notes, notices,
     ...(omittedGaps.length?{omittedGaps}:{}),
@@ -249,6 +263,42 @@ export function reviewMark(d,i){
     {opinion,revision:modified(d,i)?n.revision:''};
 }
 export const hasReviewMark=n=>Boolean(n.opinion || n.revision || n.deleted);
+export const aiOpinionLabel='AI：';
+// The opinion box holds the author's words first, then at most one AI-written part.
+export function opinionParts(n,mark){
+  if(mark?.opinion===undefined)return {human:n.opinion,ai:''};
+  const ai=n.opinion.slice(mark.opinion);
+  return {human:n.opinion.slice(0,mark.opinion),ai:mark.opinion?ai.replace(/^\n+/u,'').slice(aiOpinionLabel.length):ai};
+}
+// Returns the combined opinion and, when an AI part is present, the offset where it starts.
+export function joinOpinion(human,ai){
+  if(!ai)return [human];
+  if(!human.trim())return [ai,0];
+  return [human+(human.endsWith('\n')?'\n':'\n\n')+aiOpinionLabel+ai,human.length];
+}
+// Editing only one's own words ahead of an appended AI part leaves that part tagged, at its new offset.
+export function editedOpinionMark(from,before,after){
+  const tail=from?before.slice(from):'';
+  return tail&&after.length>tail.length&&after.endsWith(tail)?after.length-tail.length:undefined;
+}
+// A person editing a field takes it over: drop that field's AI tag.
+export function withoutEditedAiMarks(marks,base,edited){
+  const next={};
+  for(const [i,mark] of Object.entries(marks??{})){
+    const a=base.notes[i]??{}, b=edited.notes[i]??{}, kept={...mark};
+    if((a.opinion??'')!==(b.opinion??'')){
+      const from=editedOpinionMark(kept.opinion,a.opinion??'',b.opinion??'');
+      if(from===undefined)delete kept.opinion;else kept.opinion=from;
+    }
+    if((a.revision??'')!==(b.revision??'')||Boolean(a.deleted)!==Boolean(b.deleted)){delete kept.body;delete kept.replaced;}
+    if(Object.keys(kept).length)next[i]=kept;
+  }
+  return next;
+}
+export function setAiMarks(d,marks){
+  if(Object.keys(marks).length)d.aiMarks=marks;else delete d.aiMarks;
+  return d;
+}
 function annotatedSentence(text,mark,opinions){
   const comment=opinions.length?' <意见：'+escapedMarkup(opinions.join('\n'))+'>':'';
   if(mark.deleted)return '<del>'+text+'</del>'+comment;
@@ -256,28 +306,24 @@ function annotatedSentence(text,mark,opinions){
   const inline=deletionOnly(text,mark.revision);
   return inline!==null?inline+comment:text+comment+' <改为：'+escapedMarkup(mark.revision)+'>';
 }
-function* annotatedPieces(d,suggestions,onlyChanges=false){
-  const accepted=new Map();
-  for(const s of suggestions)if(s.state==='accepted'&&s.opinion?.trim()){
-    const list=accepted.get(s.sentence)??[];
-    list.push('AI：'+s.opinion);accepted.set(s.sentence,list);
-  }
+function* annotatedPieces(d,onlyChanges=false){
   let offset=0;
   for(const [i,text] of pieces(d)){
     const at=offset;offset+=text.length;
     if(i===null){yield onlyChanges?{gap:[at,offset]}:{text:deletedGap(text,at,d,true)};continue;}
-    const mark=reviewMark(d,i), opinions=[...(mark.opinion?[mark.opinion]:[]),...(accepted.get(i)??[])];
-    const changed=hasReviewMark(mark)||opinions.length;
-    if(!onlyChanges||changed)yield {text:annotatedSentence(text,mark,opinions)};
+    const mark=reviewMark(d,i);
+    // An opinion written entirely by AI is labelled in the output; appended AI parts already carry the label.
+    const opinions=mark.opinion?[(d.aiMarks?.[i]?.opinion===0?aiOpinionLabel:'')+mark.opinion]:[];
+    if(!onlyChanges||hasReviewMark(mark))yield {text:annotatedSentence(text,mark,opinions)};
   }
 }
-export function annotatedText(d,suggestions=[]){
-  return Array.from(annotatedPieces(d,suggestions),p=>p.text).join('');
+export function annotatedText(d){
+  return Array.from(annotatedPieces(d),p=>p.text).join('');
 }
-export function annotatedChanges(d,suggestions=[]){
+export function annotatedChanges(d){
   const changed=[], gaps=d.omittedGaps??[];
   let k=0;
-  for(const piece of annotatedPieces(d,suggestions,true)){
+  for(const piece of annotatedPieces(d,true)){
     if(piece.text!==undefined)changed.push(piece.text);
     if(!piece.gap)continue;
     const [start,end]=piece.gap;
@@ -366,9 +412,16 @@ export function mergeDraftEdits(base,local,latest){
       if(local[key]===undefined)delete result[key];else result[key]=local[key];
     }
   }
+  const marks=withoutEditedAiMarks(latest.aiMarks,base,local);
   for(const i of new Set([...Object.keys(base.notes),...Object.keys(local.notes)])){
     const a=base.notes[i]??{}, b=local.notes[i]??{}, c={opinion:'',revision:'',...latest.notes[i]};
-    if((a.opinion??'')!==(b.opinion??''))c.opinion=b.opinion??'';
+    if((a.opinion??'')!==(b.opinion??'')){
+      // An AI part written meanwhile under the text the author started from follows the author's new text.
+      const tag=latest.aiMarks?.[i], said=opinionParts(c,tag);
+      const [opinion,from]=said.ai&&said.human===(a.opinion??'')?joinOpinion(b.opinion??'',said.ai):[b.opinion??''];
+      c.opinion=opinion;
+      if(from!==undefined)(marks[i]??={}).opinion=from;
+    }
     if((a.revision??'')!==(b.revision??'')||Boolean(a.deleted)!==Boolean(b.deleted)){
       c.revision=b.revision??'';
       if(b.deleted)c.deleted=true;else delete c.deleted;
@@ -378,5 +431,5 @@ export function mergeDraftEdits(base,local,latest){
     }
     if(c.opinion||c.revision||c.deleted||c.autoOpinion)result.notes[i]=c;else delete result.notes[i];
   }
-  return result;
+  return setAiMarks(result,marks);
 }

@@ -8,7 +8,7 @@ export function setupOpinionUI({current,pathFor,flush,commit,paintMarks,download
   toggle.checked=false;
   let runs=new Map(), draftId=null, editorKey=null, composing=false, timer=0, request=null, committing=false;
   let statusFor=null, refreshGeneration=0, defaultPrompt='', settingsGeneration=0;
-  let settingsRevision=null, settingsDirty=false, syncingSettings=false;
+  let settingsRevision=null, settingsDirty=false, syncingSettings=false, allowed=true;
   const key=c=>c.id&&c.i!==null?c.id+':'+c.i:null;
   const end=()=>box.selectionStart===box.value.length&&box.selectionEnd===box.value.length;
   const focused=c=>c.i!==null&&document.hasFocus()&&document.activeElement===box;
@@ -45,6 +45,8 @@ export function setupOpinionUI({current,pathFor,flush,commit,paintMarks,download
     status.hidden=!message;
     if(status.textContent!==message)status.textContent=message;
     status.classList.toggle('error',Boolean(!working&&info?.failed));
+    $('opinion-controls').hidden=!allowed;
+    $('opinion-mcp-note').hidden=allowed;
     suggest.hidden=!toggle.checked||Boolean(item)||Boolean(c.opinion?.trim());
     suggest.disabled=!nextKey||Boolean(request)||c.blocked;
     paintMarks(runs);
@@ -221,5 +223,12 @@ export function setupOpinionUI({current,pathFor,flush,commit,paintMarks,download
       }
     }catch{}finally{syncingSettings=false;}
   }
-  return {render,refresh,edited,syncSettings,has:(id,i)=>draftId===id&&runs.has(i)};
+  // MCP mode hands AI writing to connected tools: the page's own completion stops generating.
+  function setAllowed(next){
+    if(allowed===next)return;
+    allowed=next;
+    if(!allowed){toggle.checked=false;cancel();statusFor=null;}
+    render();
+  }
+  return {render,refresh,edited,syncSettings,setAllowed,has:(id,i)=>draftId===id&&runs.has(i)};
 }

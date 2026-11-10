@@ -1,4 +1,5 @@
 /dist/
+/backups/
 /node_modules/
 /vendor/node_modules/
 /vendor/mcp-src/node_modules/

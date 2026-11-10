@@ -9,7 +9,7 @@ const types = new Map([
   ['/','text/html; charset=utf-8'], ['/style.css','text/css; charset=utf-8'],
   ...['app','model','docx','markdown','history','changes','opinion-ui','vendor/markdown-parser'].map(name => ['/'+name+'.mjs','text/javascript; charset=utf-8'])
 ]);
-const signature = 'diffwrite-v8';
+const signature = 'diffwrite-v9';
 const reviewApi = makeReviewApi(url.slice(0,-1));
 const server = createServer(async (req,res) => {
   const send = (status, type, content) => {

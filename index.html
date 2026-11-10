@@ -67,7 +67,7 @@
         <button id="markdown-view" hidden>渲染 Markdown</button>
         <button id="delete-selection" hidden disabled>删除选中</button>
         <button id="undo-delete" hidden disabled>撤销删除</button>
-        <button id="ai-next" hidden>AI 待审</button>
+        <button id="ai-next" hidden title="跳到下一处 AI 写的意见或改写">AI 审稿</button>
         </div>
       </div>
       <p id="notice" class="notice" role="status" hidden></p>
@@ -86,7 +86,8 @@
       <div id="legend" class="reading-foot" hidden>
         <span id="sentence-legend" class="legend-group"><span><i class="swatch"></i>未改</span><span><i class="swatch changed"></i>已改</span></span>
         <span id="inline-legend" class="legend-group"><span><i class="legend-added"></i>新增或替换</span><span id="removed-legend"><i class="legend-removed"></i>删除</span></span>
-        <span class="foot-tip">点击一句可直接编辑</span>
+        <span id="ai-legend" class="legend-group" hidden><span><i class="legend-ai"></i>AI 审稿</span><button id="ai-seen-all" class="text-action" type="button" title="内容不变，只去掉全部 AI 审稿标记">全部标为已阅</button></span>
+        <span id="foot-tip" class="foot-tip">点击一句可直接编辑</span>
       </div>
     </section>
     <div id="splitter" class="splitter" role="separator" aria-label="调整左右栏宽度" aria-orientation="vertical" aria-controls="reading-pane" tabindex="0" title="拖动调整；双击恢复 60/40"></div>
@@ -98,14 +99,18 @@
       <div class="review-body">
         <p id="hint" class="hint">点击左侧正文直接编辑。</p>
         <div id="editor" hidden>
-          <div class="quote-label"><span id="quote-caption">原句</span><span id="change-state" class="badge"></span><button id="delete-sentence">删除本句</button></div>
+          <div class="quote-label"><span id="quote-caption">原句</span><span id="change-state" class="badge"></span><button id="restore-sentence" type="button">恢复原句</button><button id="delete-sentence">删除本句</button></div>
           <blockquote id="quote"></blockquote>
           <div id="fields" class="fields">
             <div id="opinion-field" class="field">
-              <div class="opinion-head"><label for="opinion">意见栏</label><div class="opinion-controls">
-                <button id="opinion-settings-open" class="text-action" type="button">设置</button>
-                <label class="opinion-switch"><input type="checkbox" id="opinion-enabled" autocomplete="off"> AI 补全</label>
-              </div></div>
+              <div class="field-head"><label for="opinion">意见栏</label>
+                <span id="opinion-ai-tag" class="ai-tag" hidden>AI 审稿<button id="opinion-ai-seen" type="button" aria-label="意见看过了，去掉 AI 审稿标记" title="看过了，去掉标记">×</button></span>
+                <div id="opinion-controls" class="opinion-controls">
+                  <button id="opinion-settings-open" class="text-action" type="button">设置</button>
+                  <label class="opinion-switch"><input type="checkbox" id="opinion-enabled" autocomplete="off"> AI 补全</label>
+                </div>
+                <span id="opinion-mcp-note" class="field-note" hidden>MCP 模式中，网页 AI 补全已停用</span>
+              </div>
               <textarea id="opinion" rows="4" placeholder="这句哪里需要调整？"></textarea>
               <div class="opinion-tools"><button id="opinion-suggest" class="text-action" type="button" hidden>给个建议</button><span id="opinion-status" role="status" hidden></span></div>
               <div id="opinion-card" class="opinion-card" hidden>
@@ -114,10 +119,13 @@
                 <div class="ai-card-actions"><button id="opinion-reject" type="button">拒绝</button><button id="opinion-accept" class="primary" type="button">接受</button></div>
               </div>
             </div>
-            <div id="revision-field" class="field"><label for="revision">改版栏 <small id="revision-hint">留空则沿用原句</small></label>
+            <div id="revision-field" class="field">
+              <div class="field-head"><label for="revision">改版栏 <small id="revision-hint">留空则沿用原句</small></label>
+                <span id="revision-ai-tag" class="ai-tag" hidden>AI 审稿<button id="revision-ai-seen" type="button" aria-label="改写看过了，去掉 AI 审稿标记" title="看过了，去掉标记">×</button></span>
+                <button id="revision-swap" class="text-action" type="button" hidden>换回我的改写</button>
+              </div>
               <textarea id="revision" rows="5" placeholder="写下用来替换原句的文字"></textarea></div>
           </div>
-          <section id="ai-suggestions" class="ai-suggestions" hidden><h3>AI 审稿建议</h3><div id="ai-suggestion-list"></div></section>
         </div>
       </div>
     </aside>
@@ -158,7 +166,9 @@
 
   <dialog id="mcp-dialog" aria-labelledby="mcp-title">
     <h2 id="mcp-title">MCP 连接</h2>
-    <p>为每个 AI 工具建一条连接。普通连接可读稿、投稿和提交建议；只为信任的连接开启自动编辑。</p>
+    <label class="change-switch"><input id="mcp-mode" type="checkbox" role="switch"><span>MCP 模式</span></label>
+    <p id="mcp-mode-note"></p>
+    <p>为每个 AI 工具建一条连接。合法连接码即授予读稿、写意见和改写、管理稿件及补全提示词的权限；仅交给信任的工具，随时可撤销。</p>
     <code id="mcp-address"></code>
     <p id="mcp-state" role="status"></p>
     <ul id="mcp-connections" aria-label="连接列表"></ul>

@@ -17,8 +17,8 @@ async function jsonBody(req){
   try{return JSON.parse(Buffer.concat(chunks).toString('utf8'));}
   catch{throw new RequestError('JSON 格式无效。',400);}
 }
-export function makeReviewApi(origin) {
-  const store=openStore(), inFlightOpinions=new Set();
+export function makeReviewApi(origin,store=openStore()) {
+  const inFlightOpinions=new Set();
   const send=(res,status,value,headers={})=>{
     res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store',
       'X-Content-Type-Options':'nosniff',...headers});
@@ -44,8 +44,8 @@ export function makeReviewApi(origin) {
       }
       if(!browserAllowed(req)){send(res,403,{error:'只允许本机审稿页面访问。'});return true;}
       const get=req.method==='GET', post=req.method==='POST';
-      const match=/^\/api\/drafts\/([a-zA-Z0-9_-]{1,100})(?:\/(suggestions|decision|notify|seen|trash|restore|opinion-runs|opinion-generate|opinion-decision))?$/.exec(path);
-      const connection=/^\/api\/mcp-connections\/([a-zA-Z0-9_-]{1,100})\/(copy|rotate|revoke|automation)$/.exec(path);
+      const match=/^\/api\/drafts\/([a-zA-Z0-9_-]{1,100})(?:\/(ai-tags|notify|seen|trash|restore|opinion-runs|opinion-generate|opinion-decision))?$/.exec(path);
+      const connection=/^\/api\/mcp-connections\/([a-zA-Z0-9_-]{1,100})\/(copy|rotate|revoke)$/.exec(path);
       let result;
       if(get&&path==='/api/drafts') result=store.list();
       else if(get&&path==='/api/trash') result=store.list(true);
@@ -56,6 +56,8 @@ export function makeReviewApi(origin) {
       else if(get&&path==='/api/opinion-settings') result=store.opinionSettings();
       else if(post&&path==='/api/opinion-settings')result=store.saveOpinionSettings(await jsonBody(req));
       else if(get&&path==='/api/opinion-feedback')result=store.opinionFeedback();
+      else if(get&&path==='/api/mcp-mode')result={enabled:store.mcpMode()};
+      else if(post&&path==='/api/mcp-mode'){const p=await jsonBody(req);result=store.setMcpMode(p?.enabled);}
       else if(get&&path==='/api/mcp-connections')result={connections:store.connections(true),url:origin+'/mcp'};
       else if(get&&path==='/api/mcp-recipients')result=store.connections();
       else if(post&&path==='/api/mcp-connections'){const p=await jsonBody(req);result={id:store.createConnection(p?.name)};}
@@ -64,7 +66,6 @@ export function makeReviewApi(origin) {
         if(action==='copy')result={token:store.copyToken(id),url:origin+'/mcp'};
         else if(action==='rotate')store.rotate(id);
         else if(action==='revoke')store.revoke(id);
-        else {const p=await jsonBody(req);store.setAutomation(id,p?.enabled);}
       }
       else if(match){
         const [,id,action]=match;
@@ -81,10 +82,9 @@ export function makeReviewApi(origin) {
             finally{inFlightOpinions.delete(key);}
           }
         }
-        else if(get&&action==='suggestions')result=store.proposals(id);
+        else if(post&&action==='ai-tags')result=store.dismissAiTags(id,await jsonBody(req));
         else if(post&&action==='seen')store.seen(id);
         else if(post&&['trash','restore'].includes(action)){const p=await jsonBody(req);result=store.setTrash(id,p?.revision,action==='trash');}
-        else if(post&&action==='decision'){const p=await jsonBody(req);result=store.decide(id,p?.suggestionId,p?.decision,p?.revision);}
         else if(post&&action==='notify'){const p=await jsonBody(req);result=store.notify(id,p?.revision,p?.recipient);}
         else throw new RequestError('请求方式不支持。',405);
       }else throw new RequestError('未找到接口。',404);

@@ -188,7 +188,7 @@ func ownWorker(pid int) (syscall.Handle, error) {
 	return handle, nil
 }
 
-const healthSignature = "diffwrite-v8"
+const healthSignature = "diffwrite-v9"
 
 func run() error {
 	if len(os.Args) > 2 || (len(os.Args) == 2 && os.Args[1] != "--no-browser" && os.Args[1] != "--licenses") {

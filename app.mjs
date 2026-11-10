@@ -1,5 +1,5 @@
 import {fineChanges} from './changes.mjs';
-import {createDraft, restoreDraft, original, modified, revised, effectiveOpinion, mergeDraftEdits, pieces, revisedText, annotatedText, annotatedChanges, deleted, deleteTextRanges, parseAnnotated, applyImportedEdits} from './model.mjs';
+import {createDraft, restoreDraft, original, modified, revised, effectiveOpinion, mergeDraftEdits, pieces, revisedText, annotatedText, annotatedChanges, deleted, deleteTextRanges, parseAnnotated, applyImportedEdits, editedOpinionMark} from './model.mjs';
 import {setupOpinionUI} from './opinion-ui.mjs';
 import {readDocx} from './docx.mjs';
 import {saveRecord, readRecord, listRecords, listDeletedRecords, forgetPurged, recoverLegacy, migrateHistory, reviewApi, HistoryConflict} from './history.mjs';
@@ -114,11 +114,10 @@ function addCell(parent,i,value,start=null) {
   span.dataset.deleted = mode!=='source'&&deleted(draft,i);
   if (start!==null) cellOffsets.set(span,{start});
   span.dataset.selected = mode!=='source'&&i === selected;
-  if(draft.aiMarks?.[i]){span.dataset.aiEdited='true';span.title='AI 已修改本句';}
-  if(draft.notes[i]?.autoOpinion||opinionUI.has(active?.id,i)){
-    span.dataset.newOpinion='true';
-    span.title='有新的 AI 补全意见';
-  }
+  const ai=aiTitle(i), fresh=Boolean(draft.notes[i]?.autoOpinion||opinionUI.has(active?.id,i));
+  if(ai)span.dataset.aiEdited='true';
+  if(fresh)span.dataset.newOpinion='true';
+  if(ai||fresh)span.title=fresh?'有新的 AI 补全意见':ai;
   if (!cells.has(i)) cells.set(i,[]);
   if (!cells.get(i).length&&mode!=='source') {
     span.setAttribute('role','button');
@@ -258,10 +257,12 @@ function paintReading() {
   manuscript.classList.toggle('md-rendered',rendered);
   manuscript.hidden = !draft;
   $('empty').hidden = Boolean(draft);
-  $('legend').hidden = !draft || mode !== 'split' || !showChanges;
-  $('sentence-legend').hidden = changeDetail!=='sentence';
-  $('inline-legend').hidden = changeDetail==='sentence';
+  const changeLegend = mode === 'split' && showChanges;
+  $('legend').hidden = !draft;
+  $('sentence-legend').hidden = !changeLegend || changeDetail!=='sentence';
+  $('inline-legend').hidden = !changeLegend || changeDetail==='sentence';
   $('removed-legend').hidden = changeDetail!=='full';
+  $('foot-tip').hidden = mode !== 'split';
   $('draft-name').textContent = draft?.name ?? '空白稿件';
   $('draft-name').title = draft?.name ?? '';
   $('export-menu').hidden = !draft;
@@ -310,9 +311,9 @@ function paintReading() {
       if(!deleted(draft,i)||cellAt(i))continue;
       const mark=document.createElement('span');
       mark.className='sentence ai-deletion-mark';mark.dataset.index=i;mark.dataset.aiEdited='true';
-      mark.setAttribute('role','button');mark.setAttribute('aria-label','AI 已删除本句');
+      mark.setAttribute('role','button');mark.setAttribute('aria-label',aiTitle(i));
       mark.setAttribute('aria-pressed',String(i===selected));mark.dataset.selected=String(i===selected);
-      mark.tabIndex=-1;mark.title='AI 已删除本句';
+      mark.tabIndex=-1;mark.title=aiTitle(i);
       const next=[...cells.keys()].filter(j=>j>i).sort((a,b)=>a-b)[0];
       if(next!==undefined)cellAt(next).before(mark);else fragment.append(mark);
       cells.set(i,[mark]);
@@ -350,6 +351,7 @@ function paintState() {
   $('change-state').textContent = removed ? '已删除' : changed ? '已改' : '未改';
   $('delete-sentence').textContent = removed ? '恢复本句' : '删除本句';
   revision.disabled = removed;
+  $('restore-sentence').disabled=!changed||switching;
   $('change-state').dataset.changed = changed;
 }
 function paintEditor(focus = false) {
@@ -359,7 +361,6 @@ function paintEditor(focus = false) {
   if (!active) {
     $('hint').textContent = !draft ? '导入稿件后，可以在这里写意见和改版。' :
       mode === 'source' ? '切到分句模式，就能逐句审稿。' : '点击左侧正文开始。';
-    $('ai-suggestions').hidden = true;
     opinionUI.render();
     return;
   }
@@ -371,7 +372,7 @@ function paintEditor(focus = false) {
   if(opinion.value!==nextOpinion)opinion.value=nextOpinion;
   if(revision.value!==nextRevision)revision.value=nextRevision;
   paintState();
-  showSuggestions();
+  paintTags();
   opinionUI.render();
   if (focus) focusField();
 }
@@ -446,10 +447,11 @@ function updateNote(field, value) {
   if (!draft || selected === null || mode === 'source' || switching) return;
   if (undoDeletion?.some(([i])=>i===selected)) {undoDeletion = null;updateDeleteControls();}
   const note = draft.notes[selected] ?? {opinion:'', revision:''};
-  if(note[field]===value)return;
+  const before=note[field];
+  if(before===value)return;
   note[field] = value;
   delete note.autoOpinion;
-  clearAiMark(selected);
+  clearAiMark(selected,field,before,value);
   setNote(selected,note);
   for (const cell of cells.get(selected) ?? []) cell.dataset.changed = modified(draft,selected);
   if (field === 'revision' && mode !== 'source') {
@@ -462,18 +464,57 @@ function updateNote(field, value) {
 }
 let undoDeletion = null;
 
-function clearAiMark(i){
-  if(draft.aiMarks)delete draft.aiMarks[i];
-  for(const cell of cells.get(i)??[])if(cell.dataset.aiEdited){
-    delete cell.dataset.aiEdited;
-    if(!cell.dataset.newOpinion||cell.dataset.newOpinion==='false')cell.removeAttribute('title');
+// AI 审稿 tags mark fields an AI wrote; a field the author edits is the author's from then on.
+function aiTitle(i){
+  const mark=draft?.aiMarks?.[i];
+  if(!mark)return '';
+  const body=!mark.body?'':deleted(draft,i)?'删除本句':modified(draft,i)?'改写':'恢复原句';
+  return 'AI 审稿：'+[mark.opinion!==undefined&&'意见',body].filter(Boolean).join('、');
+}
+function paintCellMarks(i,fresh=opinionUI.has(active?.id,i)||Boolean(draft?.notes[i]?.autoOpinion)){
+  const ai=aiTitle(i);
+  for(const cell of cells.get(i)??[]){
+    cell.dataset.aiEdited=Boolean(ai);
+    cell.dataset.newOpinion=fresh;
+    if(ai||fresh)cell.title=fresh?'有新的 AI 补全意见':ai;
+    else cell.removeAttribute('title');
   }
+}
+function paintTags(){
+  const mark=draft?.aiMarks?.[selected], saved=mark?.replaced;
+  $('opinion-ai-tag').hidden=mark?.opinion===undefined;
+  $('opinion-ai-tag').title=mark?.opinion?'AI 在你的意见后面追加了一段，可以直接修改':'这条意见是 AI 写的，可以直接修改';
+  $('revision-ai-tag').hidden=!mark?.body;
+  $('revision-ai-tag').title='这句的改写出自 AI，可以直接修改';
+  $('revision-swap').hidden=!saved;
+  $('revision-swap').title=!saved?'':saved.deleted?'AI 改写前，你删除了这句':'AI 改写前你的版本：'+(saved.revision||original(draft,selected));
+}
+function clearAiMark(i,field,before,after){
+  const mark=draft.aiMarks?.[i];
+  if(!mark)return;
+  if(field==='opinion'){
+    const from=editedOpinionMark(mark.opinion,before,after);
+    if(from===undefined)delete mark.opinion;else mark.opinion=from;
+  }else{delete mark.body;delete mark.replaced;}
+  if(!Object.keys(mark).length)delete draft.aiMarks[i];
+  if(!Object.keys(draft.aiMarks).length)delete draft.aiMarks;
+  paintCellMarks(i);
+  if(i===selected)paintTags();
+  aiButtons();
 }
 function noteAt(i) { return draft.notes[i] ?? {opinion:'',revision:''}; }
 function setNote(i,note) {
   if (note && (note.opinion || note.revision || note.deleted || note.autoOpinion)) draft.notes[i] = note;
   else delete draft.notes[i];
 }
+$('restore-sentence').onclick=()=>{
+  if(!draft||selected===null||mode==='source'||switching)return;
+  if(inlineEdit)finishInline();
+  const next={...noteAt(selected),revision:''};delete next.deleted;
+  clearAiMark(selected,'revision');setNote(selected,next);
+  undoDeletion=null;updateDeleteControls();repaintAtScroll();paintEditor();scheduleSave();
+  outputStatus('已恢复原句，保留意见。');
+};
 function selectionInside() {
   if (!draft || mode === 'source' || switching) return null;
   const selection = window.getSelection();
@@ -490,7 +531,7 @@ function applyDeletion(updates, message, remember = true) {
   undoDeletion = remember ? [...updates.keys()].map(i => [i,draft.notes[i] ? {...draft.notes[i]} : null]) : null;
   for (const [i,note] of updates) {
     if(note)delete note.autoOpinion;
-    clearAiMark(i);
+    clearAiMark(i,'revision');
     setNote(i,note);
     opinionUI.edited(i);
   }
@@ -579,7 +620,6 @@ function importedText(name,input,markdown) {
 }
 function showWorkspace(record) {
   draft = record?.draft ?? null;
-  aiSuggestions = [];aiSnapshot = '';
   undoDeletion = null;
   markdownMode = Boolean(draft && (draft.format === 'markdown' || (!draft.format && (/\.md$/i.test(draft.name) ||
     (draft.name === '粘贴的稿件' && looksLikeMarkdown(draft.source))))));
@@ -607,7 +647,7 @@ async function switchWorkspace(load) {
       generation++;
       await persist();
     }
-    if (record) {updateSuggestions(record.meta.id).catch(()=>{});void opinionUI.refresh(record.meta.id);}
+    if (record) void opinionUI.refresh(record.meta.id);
     return true;
   } catch {
     outputStatus('无法打开稿件。当前内容未更改。',true);
@@ -927,7 +967,7 @@ async function outputDraft(kind, copy = false) {
   }
   const clean = kind === 'clean';
   const changes = kind === 'changes';
-  const content = clean ? revisedText(draft) : changes ? annotatedChanges(draft,aiSuggestions) : annotatedText(draft,aiSuggestions);
+  const content = clean ? revisedText(draft) : changes ? annotatedChanges(draft) : annotatedText(draft);
   if(changes&&!content){outputStatus('还没有改动或意见可以复制。');return;}
   if (copy) {
     try {
@@ -950,7 +990,9 @@ $('export-backup').onclick = () => outputDraft('backup');
 const dropdowns = [$('export-menu'),$('history-menu'),$('change-options')];
 document.addEventListener('click', event => {
   if(event.target.closest?.('#history-delete-dialog'))return;
-  for (const menu of dropdowns) if (menu.open && !menu.contains(event.target)) menu.open = false;
+  // 「AI 来稿」 opens the history list from outside it; that same click must not close it again.
+  const opener = event.target.closest?.('#ai-inbox') ? $('history-menu') : null;
+  for (const menu of dropdowns) if (menu.open && menu !== opener && !menu.contains(event.target)) menu.open = false;
 });
 document.addEventListener('keydown', event => {
   if (event.key !== 'Escape' || document.querySelector('dialog[open]')) return;
@@ -1015,52 +1057,14 @@ window.addEventListener('resize',()=>{if (dragPointer===null) applySplit();});
 applySplit();
 
 const openedAt = Date.now();
-let aiSuggestions = [], aiSnapshot = '', catalogSnapshot = '', refreshingAi = false;
+let catalogSnapshot = '', refreshingAi = false;
 const pathFor = (id,action='')=>'drafts/'+encodeURIComponent(id)+(action?'/'+action:'');
+const aiTagged=()=>Object.keys(draft?.aiMarks??{}).map(Number).sort((a,b)=>a-b);
 function aiButtons() {
-  const pending = aiSuggestions.filter(s=>s.state==='pending').length;
-  $('ai-next').hidden = !draft || !pending;
-  $('ai-next').textContent = 'AI 待审 '+pending;
-}
-function showSuggestions(){
-  aiButtons();
-  const section=$('ai-suggestions'), list=$('ai-suggestion-list');
-  const here=selected===null?[]:aiSuggestions.filter(s=>s.sentence===selected).reverse();
-  section.hidden=!here.length;
-  list.replaceChildren();
-  for(const s of here){
-    const card=document.createElement('article'), status=document.createElement('strong');
-    card.className='ai-card';
-    status.textContent=s.state==='accepted'?'已采纳':s.state==='rejected'?'已跳过':s.conflict?'原句改写已更新':'待审';
-    card.append(status);
-    function detail(label,value){
-      if(!value)return;
-      const line=document.createElement('p'); line.textContent=label+'：'+value;card.append(line);
-    }
-    detail('意见',s.opinion);
-    detail('建议改写',s.replacement);
-    if(s.remove)detail('建议','删除本句');
-    if(s.state==='pending'){
-      if(s.conflict)detail('提示','较新的人工改动会保留。可手动调整，或跳过此建议。');
-      const actions=document.createElement('div');actions.className='ai-card-actions';
-      for(const [decision,label] of [['accept','采纳'],['reject','跳过']]){
-        const button=document.createElement('button');button.type='button';button.textContent=label;
-        button.disabled=decision==='accept'&&s.conflict;
-        button.onclick=()=>decideSuggestion(s.id,decision);
-        actions.append(button);
-      }
-      card.append(actions);
-    }
-    list.append(card);
-  }
-}
-async function updateSuggestions(id=active?.id){
-  if(!id)return;
-  const suggestions=await reviewApi(pathFor(id,'suggestions'));
-  if(active?.id!==id)return;
-  const signature=JSON.stringify(suggestions);
-  if(signature===aiSnapshot)return;
-  aiSuggestions=suggestions;aiSnapshot=signature;showSuggestions();
+  const count=aiTagged().length;
+  $('ai-next').hidden=!count;
+  $('ai-next').textContent='AI 审稿 '+count;
+  $('ai-legend').hidden=!count;
 }
 function paintRemoteRecord(){
   const focused=document.activeElement;
@@ -1072,16 +1076,18 @@ function paintRemoteRecord(){
   repaintAtScroll();
   paintEditor();
   body.scrollTop=scroll;
-  if(textFocus&&focused.value===previousValue)focused.setSelectionRange(...caret);
+  // Text appended after the caret (an AI part following the author's opinion) leaves the caret where it was.
+  if(textFocus&&focused.value.slice(0,caret[1])===previousValue.slice(0,caret[1]))focused.setSelectionRange(...caret);
   if(focusedIndex!==null)cellAt(focusedIndex)?.focus({preventScroll:true});
 }
 function focusedFieldWouldChange(next){
   if(selected===null||mode==='source')return false;
   const target=document.activeElement;
   if(target!==opinion&&target!==revision)return false;
-  const field=target===opinion?'opinion':'revision';
-  return target.value!==(next.notes[selected]?.[field]??'')||
-    (target===revision&&deleted(draft,selected)!==deleted(next,selected));
+  const value=next.notes[selected]?.[target===opinion?'opinion':'revision']??'';
+  // An AI part appended after what the author sees can be shown at once; any other change waits for blur.
+  if(target===opinion)return !value.startsWith(target.value);
+  return target.value!==value||deleted(draft,selected)!==deleted(next,selected);
 }
 for(const field of [opinion,revision])field.addEventListener('blur',()=>setTimeout(pollAi,0));
 function loadSameRecord(record){
@@ -1092,31 +1098,46 @@ function loadSameRecord(record){
   paintEditor();
   saveLabel('已保存');
 }
-async function decideSuggestion(suggestionId,decision){
+async function dismissTags(target){
   if(!active||switching)return;
   const id=active.id;
   switching=true;opinion.readOnly=revision.readOnly=true;updateDeleteControls();
   try{
     if(!await flush())return;
-    const record=await reviewApi(pathFor(id,'decision'),{suggestionId,decision,revision:active.revision});
+    const record=await reviewApi(pathFor(id,'ai-tags'),{...target,revision:active.revision});
     if(active?.id!==id)return;
     loadSameRecord(record);
-    await updateSuggestions(id);
-    outputStatus(decision==='accept'?'已采纳 AI 建议。':'已跳过 AI 建议。');
+    if(target.sentence===undefined){
+      const left=aiTagged().length;
+      outputStatus(left?'已去掉标记。还有 '+left+' 句留着你被 AI 替换前的改写，请逐句确认。':'已去掉全部 AI 审稿标记，内容不变。');
+    }
   }catch(error){
-    outputStatus(error.message||'无法处理建议。',true);
-    updateSuggestions(id).catch(()=>{});
+    outputStatus(error.message||'无法更新标记。',true);
   }finally{
     switching=false;opinion.readOnly=revision.readOnly=false;updateDeleteControls();
   }
 }
+$('opinion-ai-seen').onclick=()=>dismissTags({sentence:selected,field:'opinion'});
+$('revision-ai-seen').onclick=()=>dismissTags({sentence:selected,field:'body'});
+$('ai-seen-all').onclick=()=>dismissTags({});
+$('revision-swap').onclick=()=>{
+  const saved=draft?.aiMarks?.[selected]?.replaced;
+  if(!saved||mode==='source'||switching)return;
+  if(inlineEdit)finishInline();
+  const next={...noteAt(selected),revision:saved.revision};
+  if(saved.deleted)next.deleted=true;else delete next.deleted;
+  clearAiMark(selected,'revision');setNote(selected,next);
+  undoDeletion=null;updateDeleteControls();repaintAtScroll();paintEditor();scheduleSave();
+  opinionUI.edited(selected);
+  outputStatus('已换回你自己的改写。');
+};
 $('ai-next').onclick=()=>{
-  const indices=[...new Set(aiSuggestions.filter(s=>s.state==='pending').map(s=>s.sentence))].sort((a,b)=>a-b);
+  const indices=aiTagged();
   const i=indices.find(i=>i>(selected??-1)) ?? indices[0];
   if(i===undefined)return;
   if(mode==='source'||!cellAt(i))setMode('split');
   if(!cellAt(i)&&isMarkdown()&&!renderSource){renderSource=true;repaintAtScroll();}
-  select(i);cellAt(i)?.scrollIntoView({block:'nearest'});
+  select(i);cellAt(i)?.scrollIntoView({block:'center'});
 };
 const notifyDialog=$('notify-dialog'), notifyRecipient=$('notify-recipient');
 const notifySend=$('notify-send'), notifyTarget=$('notify-target'), notifyManage=$('notify-manage');
@@ -1207,6 +1228,7 @@ async function pollAi(){
       });
     }
     void opinionUI.syncSettings();
+    void syncMcpMode();
     if(active && !switching){
       const item=records.find(x=>x.id===active.id);
       if(item && item.revision>active.revision && !isDirty()&&!saveInFlight&&!inlineEdit){
@@ -1214,8 +1236,10 @@ async function pollAi(){
         const record=await readRecord(id);
         if(active?.id===id&&!isDirty()&&!switching&&!inlineEdit&&record.meta.revision>active.revision){
           if(focusedFieldWouldChange(record.draft)){
-            for(const i of Object.keys(record.draft.aiMarks??{}))for(const cell of cells.get(Number(i))??[]){
-              cell.dataset.aiEdited='true';cell.title='AI 已修改本句';
+            // The focused box is left alone until the author leaves it; only flag what an AI just wrote.
+            for(const i of Object.keys(record.draft.aiMarks??{})){
+              if(JSON.stringify(draft.notes[i])===JSON.stringify(record.draft.notes[i]))continue;
+              for(const cell of cells.get(Number(i))??[]){cell.dataset.aiEdited='true';cell.title='AI 刚写了这句，离开输入框后显示';}
             }
           }else{
             draft=restoreDraft(record.draft);active=record.meta;undoDeletion=null;
@@ -1223,7 +1247,6 @@ async function pollAi(){
           }
         }
       }
-      await updateSuggestions();
       if(!isDirty())void opinionUI.refresh();
     }
   }catch{/* explicit controls show API errors; polling keeps the current work intact */}
@@ -1244,24 +1267,17 @@ function connectionAction(text,action,style=''){
   return button;
 }
 function paintConnections(){
-  connectionList.replaceChildren(...connectionRows.map(({id,name,masked,automation})=>{
+  connectionList.replaceChildren(...connectionRows.map(({id,name,masked})=>{
     const row=document.createElement('li'),details=document.createElement('div'),title=document.createElement('strong');
     const code=document.createElement('code'),actions=document.createElement('div');
     title.textContent=name;
     code.textContent=masked??'旧连接码可用，重刷后可复制';
     details.append(title,code);
-    const permission=connectionAction(automation?'自动编辑 · 已开':'开启自动编辑',()=>{
-      if(automation){void changeConnection(id,'automation',false);return;}
-      confirmConnection={id,action:'automation'};paintConnections();
-      connectionStatus('允许「'+name+'」直接编辑稿件、调整提示词及读取补全反馈。不能访问密钥。');
-      rowButton(id)?.focus();
-    },'text-action connection-permission');
-    details.append(permission);
     actions.className='connection-actions';
     if(confirmConnection?.id===id){
       const action=confirmConnection.action;
       actions.append(connectionAction('取消',()=>{confirmConnection=null;paintConnections();connectionStatus();}),
-        connectionAction(action==='automation'?'确认开启':action==='revoke'?'确认撤销':'确认重刷',()=>changeConnection(id,action,true),action==='automation'?'primary':'danger'));
+        connectionAction(action==='revoke'?'确认撤销':'确认重刷',()=>changeConnection(id,action,true),'danger'));
     }else{
       const copy=connectionAction('复制连接信息',()=>copyMcpConnection(id,name));
       copy.disabled||=!masked;
@@ -1278,6 +1294,36 @@ function paintConnections(){
   for(const el of connectionForm.elements)el.disabled=connectionBusy;
 }
 const rowButton=id=>connectionList.querySelector('[data-connection="'+id+'"] button:not(:disabled)');
+let mcpMode=null, mcpModeBusy=false;
+function paintMcpMode(enabled){
+  if(enabled===mcpMode)return;
+  mcpMode=enabled;
+  $('mcp-open').dataset.on=enabled;
+  $('mcp-open').textContent=enabled?'MCP 已开启':'MCP 连接';
+  $('mcp-mode').checked=enabled;
+  $('mcp-mode-note').textContent=enabled
+    ?'已开启：连接的 AI 可以直接写意见和改写，写进去的内容带「AI 审稿」标记。网页自带的 AI 补全已停用，避免两个 AI 同时写。'
+    :'未开启：连接的 AI 只能读稿，不能写入；网页自带的 AI 补全可以使用。';
+  opinionUI.setAllowed(!enabled);
+}
+async function syncMcpMode(){
+  if(mcpModeBusy)return;
+  try{
+    const {enabled}=await reviewApi('mcp-mode');
+    if(!mcpModeBusy)paintMcpMode(enabled);
+  }catch{/* the dialog reports errors when the author changes the mode */}
+}
+$('mcp-mode').onchange=async event=>{
+  const enabled=event.target.checked;
+  mcpModeBusy=true;event.target.disabled=true;
+  try{
+    paintMcpMode((await reviewApi('mcp-mode',{enabled})).enabled);
+    connectionStatus(enabled?'MCP 模式已开启。':'MCP 模式已关闭，连接的 AI 现在只能读取。');
+  }catch(error){
+    event.target.checked=!enabled;
+    connectionStatus(error.message,true);
+  }finally{mcpModeBusy=false;event.target.disabled=false;}
+};
 async function loadConnections(){
   const result=await reviewApi('mcp-connections');
   connectionRows=result.connections;
@@ -1306,11 +1352,11 @@ async function changeConnection(id,action,name){
     if(action==='create'){
       ({id:created}=await reviewApi('mcp-connections',{name}));
       connectionName.value='';
-    }else await reviewApi('mcp-connections/'+id+'/'+action,action==='automation'?{enabled:name}:{});
+    }else await reviewApi('mcp-connections/'+id+'/'+action,{});
     confirmConnection=null;
     await loadConnections();
     if(view===connectionView)connectionStatus(action==='create'?'已生成连接码，可以复制连接信息。':
-      action==='automation'?(name?'已允许自动编辑。':'已关闭自动编辑。'):action==='rotate'?'连接码已重刷，原有待办仍在。':'连接已撤销。');
+      action==='rotate'?'连接码已重刷，原有待办仍在。':'连接已撤销。');
   }catch(error){if(view===connectionView)connectionStatus(error.message,true);}
   finally{
     connectionBusy=false;
@@ -1379,7 +1425,7 @@ function startInline(i,cell,offset){
     if(inlineEdit?.input!==input||selected!==i||switching)return;
     const n={...noteAt(i)};
     delete n.autoOpinion;
-    clearAiMark(i);
+    clearAiMark(i,'revision');
     if(input.value.trim()){n.revision=input.value;delete n.deleted;}
     else n.deleted=true;
     setNote(i,n);
@@ -1447,15 +1493,7 @@ const opinionUI=setupOpinionUI({
   paintMarks:runs=>{
     const candidates=new Set([...markedOpinionCells,...runs.keys()]);
     markedOpinionCells=new Set(runs.keys());
-    for(const i of candidates)for(const cell of cells.get(i)??[]){
-      const mark=runs.has(i)||Boolean(draft?.notes[i]?.autoOpinion);
-      if(mark!== (cell.dataset.newOpinion==='true')){
-        cell.dataset.newOpinion=mark;
-        if(mark)cell.title='有新的 AI 补全意见';
-        else if(cell.dataset.aiEdited)cell.title='AI 已修改本句';
-        else cell.removeAttribute('title');
-      }
-    }
+    for(const i of candidates)paintCellMarks(i,runs.has(i)||Boolean(draft?.notes[i]?.autoOpinion));
   },
   commit:async(id,item,action)=>{
     if(active?.id!==id||switching)return false;

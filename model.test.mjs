@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {splitSentences,createDraft,restoreDraft,original,modified,revisedText,annotatedText,annotatedChanges,pieces,deleteTextRanges,parseAnnotated,applyImportedEdits} from './model.mjs';
+import {splitSentences,createDraft,restoreDraft,original,modified,revisedText,annotatedText,annotatedChanges,pieces,deleteTextRanges,parseAnnotated,applyImportedEdits,mergeDraftEdits} from './model.mjs';
 
 const cut = (source, breaks) => splitSentences(source,breaks).map(([a,b])=>source.slice(a,b));
 
@@ -22,6 +22,20 @@ test('keeps decimals and nonterminal punctuation; Word manual break is not a par
   assert.deepEqual(cut('3.14 米，够了；别动？！好。'),['3.14 米，够了；别动？！','好。']);
   const source='上半行\n下半行\n新段。';
   assert.deepEqual(cut(source,[source.lastIndexOf('\n')]),['上半行\n下半行','新段。']);
+});
+test('dots before ASCII letters or digits stay inside filenames and tokens',()=>{
+  assert.deepEqual(cut('练习稿.md；03_角色/示例角色.MD，数值3.14，e.g. 示例。下一句。'),[
+    '练习稿.md；03_角色/示例角色.MD，数值3.14，e.g. 示例。','下一句。'
+  ]);
+});
+test('restoring an existing draft retains its stored sentence numbering and manual notes',()=>{
+  const source='练习稿.md。下一句。', draft={version:1,name:'旧稿',source,
+    spans:[[0,4],[4,7],[7,11]],notes:{1:{opinion:'旧句块意见',revision:''}},notices:[]};
+  const restored=restoreDraft(draft);
+  assert.deepEqual(restored.spans,draft.spans);
+  assert.equal(original(restored,1),'md。');
+  assert.equal(restored.notes[1].opinion,'旧句块意见');
+  assert.equal(createDraft('新稿',source).spans.length,2);
 });
 test('updates duplicate sentences separately, only nonempty differing revisions count', () => {
   const d=createDraft('重复','　同一句。\r\n\r\n\t同一句。  ');
@@ -45,7 +59,7 @@ test('rejects invalid backups without silently dropping text or notes', () => {
 
 test('mixed Chinese and English treats abbreviations, initials, domains and numbers as internal', () => {
   assert.deepEqual(cut('Dr. Lin 到了。J. R. R. Tolkien wrote it.Stop.Go. Visit example.com. Then email a.b@example.org!再说。'),[
-    'Dr. Lin 到了。','J. R. R. Tolkien wrote it.','Stop.','Go.','Visit example.com.','Then email a.b@example.org!','再说。'
+    'Dr. Lin 到了。','J. R. R. Tolkien wrote it.Stop.Go.','Visit example.com.','Then email a.b@example.org!','再说。'
   ]);
   assert.deepEqual(cut('U.S. policy changed. It started at 3.14 p.m. Then they left. 看 https://example.com/a?b=1.2。好了。'),[
     'U.S. policy changed.','It started at 3.14 p.m.','Then they left.','看 https://example.com/a?b=1.2。','好了。'
@@ -71,7 +85,7 @@ test('annotated output retains the original and only attaches actual notes and r
 });
 
 test('keeps a closing quote with the preceding dialogue even without a separating space', () => {
-  assert.deepEqual(cut('"Stop. Wait."Then leave. Ready.2 doors opened.'),['"Stop. Wait."','Then leave.','Ready.','2 doors opened.']);
+  assert.deepEqual(cut('"Stop. Wait."Then leave. Ready.2 doors opened.'),['"Stop. Wait."','Then leave.','Ready.2 doors opened.']);
 });
 
 test('selected characters become a revision while a whole deletion retains the prior note', () => {
@@ -130,9 +144,27 @@ test('changes-only copy preserves review markup and leaves out untouched text',(
   d.notes[1]={opinion:'<重点>',revision:''};
   d.notes[2]={opinion:'',revision:'删字。'};
   d.notes[3]={opinion:'整句意见',revision:'',deleted:true};
+  d.notes[4]={opinion:'留这条',revision:''};
   d.notes[5]={opinion:'   ',revision:'无变化。'};
+  d.aiMarks={4:{opinion:0}};
   d.omittedGaps=[[12,13]];
-  assert.equal(annotatedChanges(d,[{state:'accepted',sentence:4,opinion:'留这条'},{state:'pending',sentence:0,opinion:'不复制'}]),
+  assert.equal(annotatedChanges(d),
     '意见句。 <意见：&lt;重点&gt;>\n删<del>一</del>字。\n<del>\n</del>\n<del>整句删除。</del> <意见：整句意见>\n仅 AI 建议。 <意见：AI：留这条>');
   assert.equal(annotatedChanges(createDraft('空','原句。')),'');
+});
+test('AI tags are kept only where they still describe a field; a merged human edit takes that field over',()=>{
+  const d=createDraft('标记','一。二。三。');
+  d.notes[0]={opinion:'人工\n\nAI：补充',revision:'改一。'};
+  d.notes[1]={opinion:'AI 意见',revision:''};
+  const stored={...d,aiMarks:{0:{opinion:2,body:true,replaced:{revision:'旧一。'}},1:{opinion:0,replaced:{revision:'无改写标记'}},
+    2:{opinion:0},7:{body:true}}};
+  const restored=restoreDraft(JSON.parse(JSON.stringify(stored)));
+  assert.deepEqual(restored.aiMarks,{0:{opinion:2,body:true,replaced:{revision:'旧一。'}},1:{opinion:0}});
+  assert.equal(restoreDraft({...d,aiMarks:{0:12}}).aiMarks,undefined);
+  const local=structuredClone(restored);
+  local.notes[0].revision='人工再改。';
+  assert.deepEqual(mergeDraftEdits(restored,local,restored).aiMarks,{0:{opinion:2},1:{opinion:0}});
+  local.notes[0].opinion='人工';
+  local.notes[1].opinion='我改了';
+  assert.equal(mergeDraftEdits(restored,local,restored).aiMarks,undefined);
 });

@@ -3,7 +3,8 @@ import {randomUUID,randomBytes,createHash,createCipheriv,createDecipheriv} from 
 import {mkdirSync,readFileSync,writeFileSync} from 'node:fs';
 import {join} from 'node:path';
 import {homedir} from 'node:os';
-import {restoreDraft,createDraft,original,revised,modified,deleted,reviewMark,effectiveOpinion,mergeDraftEdits} from './model.mjs';
+import {restoreDraft,createDraft,original,revised,modified,deleted,reviewMark,hasReviewMark,effectiveOpinion,mergeDraftEdits,
+  withoutEditedAiMarks,setAiMarks,opinionParts,joinOpinion} from './model.mjs';
 import {defaultOpinionPrompt,normalizeOpinionSettings} from './opinion-ai.mjs';
 import {looksLikeMarkdown,markdownSpans} from './markdown.mjs';
 
@@ -20,6 +21,7 @@ const validId=id=>typeof id==='string' && idPattern.test(id);
 const digest=value=>createHash('sha256').update(value).digest();
 const originalConnection='original';
 const blankMark={opinion:'',revision:''};
+const sameBody=(a,b)=>a.revision===b.revision&&Boolean(a.deleted)===Boolean(b.deleted);
 const ensureDraft=raw=>{
   try{return restoreDraft(raw);}catch{reject('稿件或分句数据无效。');}
 };
@@ -35,9 +37,8 @@ export function openStore(location=process.env.DIFFWRITE_REVIEW_DATA ||
   db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
   db.exec(`
     CREATE TABLE IF NOT EXISTS drafts(id TEXT PRIMARY KEY, meta TEXT NOT NULL, draft TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS suggestions(id TEXT PRIMARY KEY, draft_id TEXT NOT NULL REFERENCES drafts(id),
-      sentence INTEGER NOT NULL, state TEXT NOT NULL, payload TEXT NOT NULL);
-    CREATE INDEX IF NOT EXISTS suggestions_by_draft ON suggestions(draft_id,sentence,state);
+    CREATE TABLE IF NOT EXISTS review_baselines(recipient TEXT NOT NULL,draft_id TEXT NOT NULL REFERENCES drafts(id),
+      snapshot TEXT NOT NULL,PRIMARY KEY(recipient,draft_id));
     CREATE TABLE IF NOT EXISTS notices(id TEXT PRIMARY KEY, draft_id TEXT NOT NULL REFERENCES drafts(id),
       created_at INTEGER NOT NULL, acknowledged INTEGER NOT NULL DEFAULT 0, payload TEXT NOT NULL, notes TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS notices_by_draft ON notices(draft_id,created_at);
@@ -65,8 +66,6 @@ export function openStore(location=process.env.DIFFWRITE_REVIEW_DATA ||
     if(!q('PRAGMA table_info(notices)').all().some(column=>column.name==='recipient')){
       db.exec("ALTER TABLE notices ADD COLUMN recipient TEXT NOT NULL DEFAULT 'original'");
     }
-    if(!q('PRAGMA table_info(mcp_connections)').all().some(column=>column.name==='automation'))
-      db.exec('ALTER TABLE mcp_connections ADD COLUMN automation INTEGER NOT NULL DEFAULT 0');
     db.exec('CREATE INDEX IF NOT EXISTS notices_by_recipient ON notices(recipient,draft_id)');
     const legacy=q("SELECT value FROM settings WHERE key='mcp-token'").get();
     if(legacy){
@@ -132,7 +131,9 @@ export function openStore(location=process.env.DIFFWRITE_REVIEW_DATA ||
       const selection=encode(ids);
       q('INSERT OR IGNORE INTO purged_drafts SELECT value FROM json_each(?)').run(selection);
       q('DELETE FROM ai_edits WHERE draft_id IN (SELECT value FROM json_each(?))').run(selection);
-      q('DELETE FROM suggestions WHERE draft_id IN (SELECT value FROM json_each(?))').run(selection);
+      if(q("SELECT 1 FROM sqlite_master WHERE type='table' AND name='retired_suggestions'").get())
+        q('DELETE FROM retired_suggestions WHERE draft_id IN (SELECT value FROM json_each(?))').run(selection);
+      q('DELETE FROM review_baselines WHERE draft_id IN (SELECT value FROM json_each(?))').run(selection);
       q('DELETE FROM notices WHERE draft_id IN (SELECT value FROM json_each(?))').run(selection);
       q('DELETE FROM opinion_runs WHERE draft_id IN (SELECT value FROM json_each(?))').run(selection);
       q('DELETE FROM opinion_prompts WHERE NOT EXISTS (SELECT 1 FROM opinion_runs WHERE prompt_version=opinion_prompts.id)').run();
@@ -159,23 +160,11 @@ export function openStore(location=process.env.DIFFWRITE_REVIEW_DATA ||
       const baseline=stale&&returnDraft&&previous?aiBaseline(previous,meta.revision):previous?.draft;
       if(stale&&(!returnDraft||!baseline))reject('稿件已被其他操作更新。',409);
       const humanDraft=draft;
+      // Tags are kept by the server: a browser save can only remove those of fields the author edited.
+      // A newly imported backup brings its own.
       if(stale)draft=mergeDraftEdits(baseline,draft,previous.draft);
+      else if(previous)setAiMarks(draft,withoutEditedAiMarks(previous.draft.aiMarks,baseline,humanDraft));
       const now=Date.now();
-      delete draft.aiMarks;
-      if(previous?.draft.aiMarks){
-        const marks={...previous.draft.aiMarks};
-        for(const i of Object.keys(marks)){
-          const a=note(baseline,i), b=note(humanDraft,i);
-          const opinionEdited=a.opinion!==b.opinion, bodyEdited=a.revision!==b.revision||Boolean(a.deleted)!==Boolean(b.deleted);
-          if(opinionEdited||bodyEdited){
-            const remote=note(previous.draft,i);
-            const untouchedRemote=stale&&((!opinionEdited&&a.opinion!==remote.opinion)||
-              (!bodyEdited&&(a.revision!==remote.revision||Boolean(a.deleted)!==Boolean(remote.deleted))));
-            if(!untouchedRemote)delete marks[i];
-          }
-        }
-        if(Object.keys(marks).length)draft.aiMarks=marks;
-      }
       if(!previous)flattenOpinionBackup(draft);
       else {
         reconcileOpinionRuns(meta.id,previous.draft,draft);
@@ -231,39 +220,104 @@ export function openStore(location=process.env.DIFFWRITE_REVIEW_DATA ||
         humanReview:false,aiReview:false,unread:true},draft),draft);
     }));
   }
+  const humanBody=(draft,i)=>modified(draft,i)&&!draft.aiMarks?.[i]?.body;
+  function knownTo(recipient,id){
+    const row=q('SELECT snapshot FROM review_baselines WHERE recipient=? AND draft_id=?').get(recipient,id);
+    return row?decode(row.snapshot):{notes:{},gaps:[]};
+  }
+  function setKnown(recipient,id,snapshot){
+    q('INSERT INTO review_baselines VALUES(?,?,?) ON CONFLICT(recipient,draft_id) DO UPDATE SET snapshot=excluded.snapshot')
+      .run(recipient,id,encode(snapshot));
+  }
+  // AI writes land in the same opinion and revision fields the author uses, tagged AI 审稿.
+  // The author's opinion text is never altered, and a revision the author wrote is only replaced on request.
   function editDraft(request,recipient){
-    requireAutomation(recipient);
+    needConnection(recipient);
     return atomic(()=>repeat('edit:'+recipient,request,()=>{
       const {meta,draft}=need(request.draftId);
       if(meta.revision!==request.expectedRevision)reject('稿件已有更新，请重新读取后再编辑。',409);
-      const before=[], seen=new Set(), priorName=draft.name, marks={...draft.aiMarks};
+      const changes=[], seen=new Set(), keptHuman=[], priorName=draft.name, marks={...draft.aiMarks};
       for(const edit of request.edits??[]){
         const i=edit.sentence;
         if(!validSentence(draft,i)||seen.has(i))reject('句块不存在或重复。');
         seen.add(i);
-        if(edit.original!==original(draft,i))reject('句块原文与当前稿件不匹配。',409);
+        const source=original(draft,i);
+        if(edit.original!==source)reject('句块原文与当前稿件不匹配。',409);
         if(edit.opinion===undefined&&edit.replacement===undefined&&edit.deleted===undefined)reject('请选择要修改的内容。');
         if(edit.deleted===true&&edit.replacement!==undefined)reject('删除与改写不能同时提交。');
-        const old=draft.notes[i], next={...note(draft,i)};
-        if(edit.opinion!==undefined)next.opinion=edit.opinion;
-        if(edit.replacement!==undefined){next.revision=edit.replacement;delete next.deleted;}
-        if(edit.deleted===true)next.deleted=true;
-        if(edit.deleted===false)delete next.deleted;
+        const old=draft.notes[i], next={...note(draft,i)}, mark={...marks[i]}, body={revision:next.revision};
+        if(next.deleted)body.deleted=true;
+        if(edit.replacement!==undefined){body.revision=edit.replacement===source?'':edit.replacement;delete body.deleted;}
+        if(edit.deleted===true)body.deleted=true;
+        if(edit.deleted===false)delete body.deleted;
+        let aside='';
+        if(!sameBody(next,body)){
+          if(humanBody(draft,i)&&edit.overwriteHumanRevision!==true){
+            aside=edit.deleted===true?'建议删除本句。':edit.replacement&&body.revision?'建议改为：'+edit.replacement:
+              edit.replacement===undefined?'建议恢复本句。':'建议恢复原句。';
+            keptHuman.push({sentence:i,humanRevision:deleted(draft,i)?null:revised(draft,i),
+              note:'这句有作者的人工改写，未覆盖；改写建议已写进意见栏。'});
+          }else{
+            if(humanBody(draft,i))mark.replaced={revision:next.revision,...(next.deleted?{deleted:true}:{})};
+            next.revision=body.revision;
+            if(body.deleted)next.deleted=true;else delete next.deleted;
+            // Undoing its own change on an untouched sentence leaves nothing to tag.
+            if(next.deleted||(next.revision.trim()&&next.revision!==source)||mark.replaced)mark.body=true;
+            else delete mark.body;
+          }
+        }
+        if(edit.opinion!==undefined||aside){
+          const parts=opinionParts(next,mark), said=edit.opinion?.trim()??parts.ai;
+          const [opinion,from]=joinOpinion(parts.human,said.endsWith(aside)?said:[said,aside].filter(Boolean).join('\n'));
+          next.opinion=opinion;
+          if(from===undefined)delete mark.opinion;else mark.opinion=from;
+        }
         if(!noteChanged(note(draft,i),next))continue;
         delete next.autoOpinion;
-        before.push([i,old??null,next]);
-        marks[i]=meta.revision+1;
+        changes.push([i,old??null,next]);
+        if(Object.keys(mark).length)marks[i]=mark;else delete marks[i];
         if(next.opinion||next.revision||next.deleted)draft.notes[i]=next;else delete draft.notes[i];
       }
       if(request.title!==undefined)draft.name=textOf(request.title,220).trim();
-      if(!before.length&&draft.name===priorName)return {draftId:meta.id,revision:meta.revision,changed:[]};
+      if(!changes.length&&draft.name===priorName)return {draftId:meta.id,revision:meta.revision,changed:[],keptHuman};
       const revision=meta.revision+1;
-      draft.aiMarks=marks;
+      setAiMarks(draft,marks);
       reconcileOpinionRuns(meta.id,draft,draft);
-      q('INSERT INTO ai_edits VALUES(?,?,?)').run(meta.id,revision,encode({priorName,changes:before,actor:recipient}));
+      q('INSERT INTO ai_edits VALUES(?,?,?)').run(meta.id,revision,encode({priorName,changes,actor:recipient}));
       write(describe({...meta,revision,updatedAt:Date.now(),aiReview:true},draft),draft);
-      return {draftId:meta.id,revision,changed:before.map(x=>x[0])};
+      // The writer already knows its own edits; later notices report only what the author did to them.
+      const known=knownTo(recipient,meta.id);
+      for(const [i] of changes){
+        const mark=reviewMark(draft,i);
+        if(hasReviewMark(mark))known.notes[i]=mark;else delete known.notes[i];
+      }
+      setKnown(recipient,meta.id,known);
+      return {draftId:meta.id,revision,changed:changes.map(x=>x[0]),keptHuman};
     }));
+  }
+  // The author has read an AI-written field and keeps it as is: drop its tag without editing.
+  function dismissAiTags(id,request){
+    return atomic(()=>{
+      const {meta,draft}=need(id);
+      if(request?.revision!==meta.revision)reject('稿件已有更新，请重新打开。',409);
+      const {sentence,field}=request, marks={...draft.aiMarks};
+      if(sentence!==undefined){
+        if(!validSentence(draft,sentence)||!['opinion','body'].includes(field))reject('无效的标记。');
+        const mark={...marks[sentence]};
+        if(field==='opinion')delete mark.opinion;
+        else{delete mark.body;delete mark.replaced;}
+        if(Object.keys(mark).length)marks[sentence]=mark;else delete marks[sentence];
+      }else for(const [i,mark] of Object.entries(marks)){
+        // Marking everything read must not silently drop a rewrite the author can still switch back to.
+        if(mark.replaced)marks[i]={body:true,replaced:mark.replaced};else delete marks[i];
+      }
+      if(!noteChanged(marks,draft.aiMarks??{}))return {meta,draft};
+      setAiMarks(draft,marks);
+      const revision=meta.revision+1;
+      q('INSERT INTO ai_edits VALUES(?,?,?)').run(id,revision,encode({priorName:draft.name,changes:[],actor:'author'}));
+      const next=write(describe({...meta,revision,updatedAt:Date.now(),humanReview:true},draft),draft);
+      return {meta:next,draft};
+    });
   }
   function aiBaseline(previous,from){
     const rows=q('SELECT revision,payload FROM ai_edits WHERE draft_id=? AND revision>? ORDER BY revision DESC').all(previous.meta.id,from);
@@ -277,92 +331,26 @@ export function openStore(location=process.env.DIFFWRITE_REVIEW_DATA ||
     }
     return base;
   }
-  function suggestionRows(id){
-    return q('SELECT id,sentence,state,payload FROM suggestions WHERE draft_id=? ORDER BY rowid').all(id)
-      .map(r=>({id:r.id,sentence:r.sentence,state:r.state,...decode(r.payload)}));
-  }
-  function proposals(id){
-    const {draft}=need(id);
-    return suggestionRows(id).map(({baseText,author,...s})=>({...s,conflict:s.state==='pending' &&
-      (s.replacement!==undefined || s.remove) && revised(draft,s.sentence)!==baseText}));
-  }
-  function review(request,recipient=originalConnection){
-    return atomic(()=>repeat(recipient===originalConnection?'review':'review:'+recipient,request,()=>{
-      const {meta,draft}=need(request.draftId);
-      if(request.expectedRevision!==meta.revision)reject('人工稿件已有更新，请先重新读取。',409);
-      const ids=[];
-      for(const s of request.suggestions){
-        const i=s.sentence;
-        if(!Number.isSafeInteger(i)||i<0||i>=draft.spans.length)reject('句块编号超出稿件范围。');
-        if(s.original!==original(draft,i))reject('句块原文与当前稿件不匹配，请重新读取。',409);
-        if(s.remove && s.replacement!==undefined)reject('删除与改写不能同时提交。');
-        if(!s.opinion?.trim()&&!s.replacement?.trim()&&!s.remove)reject('建议须包含意见、改写或删除。');
-        const id=randomUUID();
-        const payload={author:recipient,baseText:revised(draft,i),createdAt:Date.now(),opinion:s.opinion?.trim()||'',
-          ...(s.replacement!==undefined ? {replacement:textOf(s.replacement,100000)} : {}),
-          ...(s.remove ? {remove:true} : {})};
-        q("INSERT INTO suggestions VALUES(?,?,?,'pending',?)").run(id,meta.id,i,encode(payload));
-        ids.push(id);
-      }
-      putMeta({...meta,aiReview:true,updatedAt:Date.now()});
-      return {draftId:meta.id,revision:meta.revision,suggestionIds:ids};
-    }));
-  }
-  function decide(id,suggestionId,decision,expectedRevision){
-    if(!['accept','reject'].includes(decision)||!validId(suggestionId))reject('无效的审稿操作。');
-    return atomic(()=>{
-      const {meta,draft}=need(id);
-      if(expectedRevision!==meta.revision)reject('稿件已更新，请重新打开后再处理。',409);
-      const row=q('SELECT * FROM suggestions WHERE id=? AND draft_id=?').get(suggestionId,id);
-      if(!row||row.state!=='pending')reject('此建议已处理或不存在。',409);
-      const payload=decode(row.payload), i=row.sentence;
-      const modifies=payload.replacement!==undefined || payload.remove;
-      if(decision==='accept' && modifies){
-        if(revised(draft,i)!==payload.baseText)reject('该句已有较新的人工改动，未覆盖。',409);
-        const n={...note(draft,i)};
-        if(payload.remove)n.deleted=true;
-        else {n.revision=payload.replacement;delete n.deleted;}
-        draft.notes[i]=n;
-      }
-      reconcileOpinionRuns(id,draft,draft);
-      q('UPDATE suggestions SET state=? WHERE id=?').run(decision==='accept'?'accepted':'rejected',suggestionId);
-      const next=write(describe({...meta,revision:meta.revision+1,updatedAt:Date.now(),humanReview:true},draft),draft);
-      return {meta:next,draft};
-    });
-  }
   function notify(id,expectedRevision,recipient){
     return atomic(()=>{
       const connection=needConnection(recipient);
       const {meta,draft}=need(id);
       if(expectedRevision!==meta.revision)reject('稿件已有更新，请先重新打开。',409);
-      const prev=q('SELECT notes FROM notices WHERE recipient=? AND draft_id=? ORDER BY rowid DESC LIMIT 1').get(recipient,id);
-      const snapshot=prev?decode(prev.notes):{};
-      const old=snapshot.notes??snapshot, known=new Set(snapshot.handled??[]);
-      const decisions=suggestionRows(id).filter(s=>s.state!=='pending');
+      const snapshot=knownTo(recipient,id), old=snapshot.notes;
       const marks=Object.fromEntries(Object.keys(draft.notes).map(i=>[i,reviewMark(draft,Number(i))]));
-      const newDecisions=new Map();
-      for(const s of decisions){
-        if(s.state==='accepted'&&s.opinion?.trim()){
-          const mark=marks[s.sentence]??={...blankMark};
-          (mark.acceptedOpinions??=[]).push(s.opinion);
-        }
-        if((s.author??originalConnection)===recipient&&!known.has(s.id)){
-          const values=newDecisions.get(s.sentence)??[];
-          values.push({suggestionId:s.id,state:s.state});newDecisions.set(s.sentence,values);
-        }
-      }
       const changes=[];
-      const candidates=[...new Set([...Object.keys(old).map(Number),...Object.keys(marks).map(Number),...newDecisions.keys()])].sort((a,b)=>a-b);
+      const candidates=[...new Set([...Object.keys(old).map(Number),...Object.keys(marks).map(Number)])].sort((a,b)=>a-b);
       for(const i of candidates){
         const before=old[i]??blankMark, after=marks[i]??blankMark;
         // Legacy snapshots stored raw input, including drafts that never changed the effective sentence.
         const normalized={opinion:before.opinion?.trim()?before.opinion:'',
           revision:!before.deleted&&before.revision?.trim()&&before.revision!==original(draft,i)?before.revision:'',
-          ...(before.deleted?{deleted:true}:{}),...(before.acceptedOpinions?.length?{acceptedOpinions:before.acceptedOpinions}:{})};
-        const selected=newDecisions.get(i)??[];
-        if(!selected.length&&!noteChanged(normalized,after))continue;
+          ...(before.deleted?{deleted:true}:{})};
+        if(!noteChanged(normalized,after))continue;
         const restored=Boolean((normalized.deleted||normalized.revision)&&!after.deleted&&!after.revision);
-        changes.push({sentence:i,original:original(draft,i),...after,effective:revised(draft,i),decisions:selected,
+        const tag=draft.aiMarks?.[i];
+        changes.push({sentence:i,original:original(draft,i),...after,effective:revised(draft,i),
+          ...(tag?.opinion!==undefined?{aiOpinion:true}:{}),...(tag?.body?{aiRevision:true}:{}),
           ...(restored?{restored:true}:{}),...(normalized.opinion&&!after.opinion?{opinionCleared:true}:{})});
       }
       const gaps=draft.omittedGaps??[], oldGaps=snapshot.gaps??[];
@@ -379,8 +367,8 @@ export function openStore(location=process.env.DIFFWRITE_REVIEW_DATA ||
       if(!payload.changeCount)return {...payload,queued:false};
       Object.assign(payload,{id:randomUUID(),createdAt:Date.now()});
       q('INSERT INTO notices(id,draft_id,created_at,payload,notes,recipient) VALUES(?,?,?,?,?,?)')
-        .run(payload.id,id,payload.createdAt,encode({...payload,changes,...(gapChanges.length?{gapChanges}:{})}),
-          encode({notes:marks,gaps,handled:decisions.filter(s=>(s.author??originalConnection)===recipient).map(s=>s.id)}),recipient);
+        .run(payload.id,id,payload.createdAt,encode({...payload,changes,...(gapChanges.length?{gapChanges}:{})}),'{}',recipient);
+      setKnown(recipient,id,{notes:marks,gaps});
       return {...payload,queued:true};
     });
   }
@@ -405,17 +393,17 @@ export function openStore(location=process.env.DIFFWRITE_REVIEW_DATA ||
   }
   function readSentences(id,offset,limit){
     const {meta,draft}=need(id);
-    const suggestions=new Map();
-    for(const s of proposals(id)) if(s.sentence>=offset&&s.sentence<offset+limit){
-      const group=suggestions.get(s.sentence)??[];group.push(s);suggestions.set(s.sentence,group);
-    }
     return {meta,format:draft.format??null,total:draft.spans.length,omittedGaps:draft.omittedGaps??[],
-      sentences:draft.spans.slice(offset,offset+limit).map(([start,end],n)=>{
-        const i=offset+n;
+      sentences:draft.spans.slice(offset,offset+limit).map(([start,end],k)=>{
+        const i=offset+k, n=note(draft,i), tag=draft.aiMarks?.[i];
         return {sentence:i,start,end,separatorBefore:draft.source.slice(draft.spans[i-1]?.[1]??0,start),
-          original:original(draft,i),...(draft.aiMarks?.[i]?{aiEditedAtRevision:draft.aiMarks[i]}:{}),humanOpinion:note(draft,i).opinion,
-          ...(note(draft,i).autoOpinion?{effectiveOpinion:effectiveOpinion(draft,i)}:{}),
-          humanRevision:note(draft,i).revision,deleted:deleted(draft,i),effective:revised(draft,i),suggestions:suggestions.get(i)??[]};
+          original:original(draft,i),opinion:n.opinion,
+          ...(n.opinion?{opinionBy:tag?.opinion===undefined?'human':tag.opinion?'human+ai':'ai'}:{}),
+          ...(tag?.opinion?{aiOpinion:opinionParts(n,tag).ai}:{}),
+          ...(n.autoOpinion?{effectiveOpinion:effectiveOpinion(draft,i)}:{}),
+          revision:n.revision,deleted:deleted(draft,i),effective:revised(draft,i),
+          ...(modified(draft,i)?{revisionBy:tag?.body?'ai':'human'}:{}),
+          ...(tag?.replaced?{overwrittenHumanRevision:tag.replaced.deleted?null:tag.replaced.revision}:{})};
       }),next:offset+limit<draft.spans.length?offset+limit:null,
       ...(offset+limit>=draft.spans.length ? {tail:draft.source.slice(draft.spans.at(-1)[1])} : {})};
   }
@@ -460,12 +448,12 @@ export function openStore(location=process.env.DIFFWRITE_REVIEW_DATA ||
     });
   }
   function automationOpinion(recipient){
-    requireAutomation(recipient);
+    needConnection(recipient);
     const {model,prompt,promptVersion,settingsRevision}=opinionConfig();
     return {model,prompt,promptVersion,settingsRevision:settingsRevision??'initial'};
   }
   function setAutomationOpinion(recipient,request){
-    requireAutomation(recipient);
+    needConnection(recipient);
     const previous=opinionConfig();
     checkSettingsRevision(previous,request.expectedRevision);
     const restored=request.restoreVersion?q('SELECT body FROM prompt_history WHERE id=?').get(request.restoreVersion):null;
@@ -479,13 +467,13 @@ export function openStore(location=process.env.DIFFWRITE_REVIEW_DATA ||
     return automationOpinion(recipient);
   }
   function promptVersions(recipient,offset,limit){
-    requireAutomation(recipient);
+    needConnection(recipient);
     const rows=q('SELECT id,body,created_at AS createdAt FROM prompt_history ORDER BY rowid DESC LIMIT ? OFFSET ?').all(limit+1,offset);
     return {versions:rows.slice(0,limit).map(({id,createdAt,body})=>({id,createdAt,preview:body.slice(0,120)})),
       next:rows.length>limit?offset+limit:null};
   }
   function previewOpinion(recipient,request){
-    requireAutomation(recipient);
+    needConnection(recipient);
     const {draft}=need(request.draftId), i=request.sentence;
     if(!validSentence(draft,i))reject('找不到要试跑的句子。');
     const config=opinionConfig();
@@ -498,7 +486,7 @@ export function openStore(location=process.env.DIFFWRITE_REVIEW_DATA ||
     return {input,config:{...config,apiKey,prompt:request.prompt?.trim()||config.prompt}};
   }
   function automationFeedback(recipient,draftId,offset,limit){
-    requireAutomation(recipient);
+    needConnection(recipient);
     if(draftId)need(draftId);
     const rows=q('SELECT r.* FROM opinion_runs r JOIN drafts ON drafts.id=r.draft_id WHERE '+live+
       (draftId?' AND r.draft_id=?':'')+' ORDER BY r.rowid DESC LIMIT ? OFFSET ?')
@@ -518,6 +506,7 @@ export function openStore(location=process.env.DIFFWRITE_REVIEW_DATA ||
   function prepareOpinion(id,request){
     const {meta,draft}=need(id), i=request?.sentence;
     if(!validSentence(draft,i))reject('找不到要补全的句子。');
+    if(mcpMode())reject('MCP 模式已开启，网页的 AI 补全已停用。',409);
     const input=opinionInput(draft,i), manual=request.manual===true;
     if(meta.revision!==request.revision||input.prefix!==request.prefix)reject('意见已更新，请继续编辑或重新请求。',409);
     if(!manual&&!input.prefix.trim())return null;
@@ -704,21 +693,85 @@ export function openStore(location=process.env.DIFFWRITE_REVIEW_DATA ||
       const {id,name}=row;
       if(!withMasks)return {id,name};
       const token=readToken(row);
-      return {id,name,automation:Boolean(row.automation),masked:token?mask(token):null};
+      return {id,name,masked:token?mask(token):null};
     });
-  }
-  function canAutomate(id){return Boolean(needConnection(id).automation);}
-  function requireAutomation(id){if(!canAutomate(id))reject('此连接未开启自动编辑。',403);}
-  function setAutomation(id,enabled){
-    needConnection(id);
-    if(typeof enabled!=='boolean')reject('自动编辑设置无效。');
-    q('UPDATE mcp_connections SET automation=? WHERE id=?').run(Number(enabled),id);
   }
   function copyToken(id){
     const token=readToken(needConnection(id));
     if(!token)reject('当前连接码不可复制，请先重刷。',409);
     return token;
   }
-  return {list,read,setTrash,purge,purgedIds,saveBrowser,migrate,seen,publish,proposals,review,decide,notify,listNotices,
-    readNotice,ack,readSentences,createConnection,connections,rotate,revoke,authorized,copyToken,canAutomate,setAutomation,editDraft,automationOpinion,setAutomationOpinion,promptVersions,previewOpinion,automationFeedback,opinionSettings,saveOpinionSettings,prepareOpinion,finishOpinion,currentOpinions,decideOpinion,opinionFeedback,close:()=>db.close()};
+  const mcpMode=()=>q("SELECT value FROM settings WHERE key='mcp-mode'").get()?.value==='on';
+  function setMcpMode(enabled){
+    if(typeof enabled!=='boolean')reject('无效的 MCP 模式。');
+    q("INSERT INTO settings VALUES('mcp-mode',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(enabled?'on':'off');
+    return {enabled};
+  }
+  // One-time move from separate suggestion records to AI 审稿 tags on ordinary opinions and revisions.
+  function upgrade(){
+    if(q('PRAGMA user_version').get().user_version>=1)return;
+    atomic(()=>{
+      const legacy=Boolean(q("SELECT 1 FROM sqlite_master WHERE type='table' AND name='suggestions'").get());
+      const known=new Map();
+      const knownBy=(recipient,id)=>{
+        const key=recipient+'\n'+id;
+        if(!known.has(key))known.set(key,{recipient,id,notes:{},gaps:[]});
+        return known.get(key);
+      };
+      // Each recipient's last notice is what it has already been told.
+      for(const {recipient,draft_id,notes} of q('SELECT recipient,draft_id,notes FROM notices n WHERE rowid=(SELECT max(rowid) FROM notices WHERE recipient=n.recipient AND draft_id=n.draft_id)').all()){
+        const snapshot=decode(notes), entry=knownBy(recipient,draft_id);
+        entry.notes=snapshot.notes??snapshot;
+        entry.gaps=snapshot.gaps??[];
+        for(const mark of Object.values(entry.notes))delete mark.acceptedOpinions;
+      }
+      for(const row of q('SELECT id,meta,draft FROM drafts').all()){
+        const meta=decode(row.meta), draft=decode(row.draft), marks={}, changes=[];
+        // A tag used to be one revision number per sentence; the edit log tells which field the AI wrote.
+        for(const [i,revision] of Object.entries(draft.aiMarks??{})){
+          const logged=q('SELECT payload FROM ai_edits WHERE draft_id=? AND revision=?').get(row.id,revision);
+          const change=logged&&decode(logged.payload).changes.find(c=>String(c[0])===i);
+          const now=note(draft,i), before=change?.[1]??blankMark, after=change?.[2], mark={};
+          if(modified(draft,Number(i))&&(!after||(!sameBody(before,after)&&sameBody(after,now))))mark.body=true;
+          if(after&&now.opinion&&after.opinion!==before.opinion&&after.opinion===now.opinion)mark.opinion=0;
+          if(Object.keys(mark).length)marks[i]=mark;
+        }
+        if(legacy){
+          // The newest applied suggestion's opinion becomes the sentence's opinion if its change still stands and
+          // the author has written none. Pending, declined and superseded ones only remain in retired_suggestions.
+          const applied=new Map();
+          for(const s of q("SELECT sentence,payload FROM suggestions WHERE draft_id=? AND state='accepted' ORDER BY rowid").all(row.id))
+            applied.set(s.sentence,decode(s.payload));
+          for(const [i,s] of applied){
+            const now=note(draft,i), opinion=s.opinion?.trim();
+            const stands=s.remove?marks[i]?.body&&Boolean(now.deleted):
+              s.replacement===undefined||(marks[i]?.body&&!now.deleted&&now.revision===s.replacement);
+            if(!opinion||now.opinion.trim()||!stands)continue;
+            const next={...now,opinion};
+            changes.push([i,draft.notes[i]??null,next]);
+            draft.notes[i]=next;
+            (marks[i]??={}).opinion=0;
+            knownBy(s.author??originalConnection,row.id).notes[i]=reviewMark(draft,i);
+          }
+        }
+        if(!changes.length&&!noteChanged(marks,draft.aiMarks??{}))continue;
+        setAiMarks(draft,marks);
+        const revision=meta.revision+1;
+        q('INSERT INTO ai_edits VALUES(?,?,?)').run(row.id,revision,encode({priorName:draft.name,changes,actor:'upgrade'}));
+        write(describe({...meta,revision},draft),draft);
+      }
+      for(const {recipient,id,notes,gaps} of known.values())setKnown(recipient,id,{notes,gaps});
+      if(legacy){
+        db.exec('ALTER TABLE suggestions RENAME TO retired_suggestions');
+        q("DELETE FROM operations WHERE key LIKE 'review:%'").run();
+      }
+      // Installations that already connect AI tools keep writing through MCP.
+      if(q('SELECT 1 FROM mcp_connections WHERE revoked=0').get())
+        q("INSERT OR IGNORE INTO settings VALUES('mcp-mode','on')").run();
+      db.exec('PRAGMA user_version=1');
+    });
+  }
+  upgrade();
+  return {list,read,setTrash,purge,purgedIds,saveBrowser,migrate,seen,publish,notify,listNotices,dismissAiTags,mcpMode,setMcpMode,
+    readNotice,ack,readSentences,createConnection,connections,rotate,revoke,authorized,copyToken,editDraft,automationOpinion,setAutomationOpinion,promptVersions,previewOpinion,automationFeedback,opinionSettings,saveOpinionSettings,prepareOpinion,finishOpinion,currentOpinions,decideOpinion,opinionFeedback,close:()=>db.close()};
 }
