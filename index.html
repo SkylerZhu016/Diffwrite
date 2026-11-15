@@ -39,6 +39,11 @@
     </div>
   </header>
   <p id="output-state" class="toast" role="status" hidden></p>
+  <aside id="ai-arrival" class="ai-arrival" role="status" hidden>
+    <div class="ai-arrival-head"><strong id="ai-arrival-title">收到 AI 新稿</strong><button id="ai-arrival-close" aria-label="关闭新稿提示">×</button></div>
+    <ul id="ai-arrival-names"></ul>
+    <button id="ai-arrival-open">打开历史记录</button>
+  </aside>
   <main class="workspace">
     <section id="reading-pane" class="reading" aria-labelledby="draft-name">
       <div class="reading-head">
@@ -66,11 +71,10 @@
         </div>
         <button id="markdown-view" hidden>渲染 Markdown</button>
         <button id="delete-selection" hidden disabled>删除选中</button>
-        <button id="undo-delete" hidden disabled>撤销删除</button>
+        <button id="undo-delete" hidden disabled>撤销正文编辑</button>
         <button id="ai-next" hidden title="跳到下一处 AI 写的意见或改写">AI 审稿</button>
         </div>
       </div>
-      <p id="notice" class="notice" role="status" hidden></p>
       <div id="reading-body" class="reading-body" role="tabpanel" aria-labelledby="tab-split">
         <div id="empty" class="empty">
           <h2>新稿件</h2>
@@ -79,15 +83,16 @@
             <strong>拖入文件，或点击选择</strong>
             <small>TXT、Markdown、Word 或审稿备份</small>
           </button>
-          <p>也可以粘贴文本，或从右上角打开历史稿件。</p>
+          <p>也可以直接按 Ctrl+V 粘贴，或从右上角打开历史稿件。</p>
         </div>
         <div id="manuscript" class="prose" hidden></div>
+        <span id="body-editor" class="sentence-editor" role="textbox" aria-multiline="true" aria-label="编辑当前句源码" spellcheck="false" tabindex="0" hidden></span>
       </div>
       <div id="legend" class="reading-foot" hidden>
         <span id="sentence-legend" class="legend-group"><span><i class="swatch"></i>未改</span><span><i class="swatch changed"></i>已改</span></span>
         <span id="inline-legend" class="legend-group"><span><i class="legend-added"></i>新增或替换</span><span id="removed-legend"><i class="legend-removed"></i>删除</span></span>
         <span id="ai-legend" class="legend-group" hidden><span><i class="legend-ai"></i>AI 审稿</span><button id="ai-seen-all" class="text-action" type="button" title="内容不变，只去掉全部 AI 审稿标记">全部标为已阅</button></span>
-        <span id="foot-tip" class="foot-tip">点击一句可直接编辑</span>
+        <span id="foot-tip" class="foot-tip">点击正文即可编辑 · 可跨段选中删除</span>
       </div>
     </section>
     <div id="splitter" class="splitter" role="separator" aria-label="调整左右栏宽度" aria-orientation="vertical" aria-controls="reading-pane" tabindex="0" title="拖动调整；双击恢复 60/40"></div>

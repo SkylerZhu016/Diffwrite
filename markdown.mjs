@@ -100,6 +100,36 @@ function sourceOffsets(value,raw,start) {
   return aligned;
 }
 
+// Code delimiters and indentation are syntax, not the caret's editable text.
+// Include the terminal offset so typing at the end stays inside the delimiter.
+function codeOffsets(node,raw,start) {
+  if(node.type==='inlineCode') {
+    const fence=/^`+/.exec(raw)?.[0].length;
+    if(!fence)return null;
+    const at=raw.indexOf(node.value,fence);
+    if(at<0||at+node.value.length>raw.length-fence)return null;
+    return Array.from({length:node.value.length+1},(_,i)=>start+at+i);
+  }
+  const lines=[...raw.matchAll(/[^\r\n]*(?:\r\n|\r|\n|$)/g)].filter(x=>x[0]);
+  if(/^(?:`{3,}|~{3,})/.test(raw))lines.shift();
+  const values=[...node.value.matchAll(/[^\r\n]*(?:\r\n|\r|\n|$)/g)].filter(x=>x[0]);
+  const positions=[];
+  let end=start;
+  for(const [i,match] of values.entries()) {
+    const line=lines[i];if(!line)return null;
+    const value=match[0].replace(/[\r\n]+$/,''),newline=match[0].slice(value.length);
+    const content=line[0].replace(/[\r\n]+$/,'');
+    const indent=content.length-value.length;
+    if(indent<0||!content.endsWith(value)||!/^[ \t>]*$/.test(content.slice(0,indent)))return null;
+    for(let j=0;j<value.length;j++)positions.push(start+line.index+indent+j);
+    end=start+line.index+content.length;
+    for(let j=0;j<newline.length;j++)positions.push(end+j);
+    end+=newline.length;
+  }
+  positions.push(end);
+  return positions;
+}
+
 export function renderMarkdown(source, decorate) {
   const out = document.createDocumentFragment();
   const text = (parent,value,start,end,offsets) => {
@@ -107,13 +137,34 @@ export function renderMarkdown(source, decorate) {
   };
   function leaf(parent,node,display = node.value) {
     const [a,b] = range(node);
-    text(parent,display,a,b,source.slice(a,b) === display ? undefined : sourceOffsets(display,source.slice(a,b),a));
+    const raw=source.slice(a,b);
+    const offsets=['inlineCode','code'].includes(node.type)?codeOffsets(node,raw,a):
+      raw===display?undefined:sourceOffsets(display,raw,a);
+    text(parent,display,a,b,offsets);
   }
   const tags = {paragraph:'p', emphasis:'em', strong:'strong', delete:'del', blockquote:'blockquote',
     listItem:'li',tableCell:'td',tableRow:'tr',footnoteDefinition:'aside'};
   function visit(parent,node,customTag) {
-    const add = tag => {const el = document.createElement(tag);parent.append(el);return el;};
-    const children = el => {for (const child of node.children ?? []) visit(el,child);};
+    const add = tag => {const el = document.createElement(tag);
+      if(node.position){el.dataset.mdStart=node.position.start.offset;el.dataset.mdEnd=node.position.end.offset;}
+      parent.append(el);return el;};
+    const children = el => {
+      let end=node.position?.start.offset??0;
+      const gap=(stop,edge=false)=>{
+        const raw=source.slice(end,stop),lines=raw.match(/\r\n|\r|\n/g);
+        if(node.type!=='root'||!lines||!/^[ \t\r\n]*$/.test(raw))return;
+        const count=lines.length-(edge?0:1);if(count<=0)return;
+        const marker=document.createElement('span');marker.className='md-gap';
+        marker.dataset.start=end;marker.dataset.end=stop;marker.style.height=count+'lh';
+        const skip=edge?0:(raw.indexOf(lines[0])+lines[0].length);
+        text(marker,raw.slice(skip),end+skip,stop);
+        el.append(marker);
+      };
+      for(const [i,child] of (node.children??[]).entries()){
+        gap(range(child)[0],i===0);visit(el,child);end=range(child)[1];
+      }
+      gap(node.position?.end.offset??end,true);
+    };
     switch(node.type) {
       case 'root': children(parent); return;
       case 'text': leaf(parent,node); return;

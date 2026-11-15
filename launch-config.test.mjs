@@ -1,0 +1,20 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import {mkdtempSync,mkdirSync,writeFileSync,rmSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {launchConfig} from './launch-config.mjs';
+test('all normal launches use the machine profile; explicit isolation still overrides it',t=>{
+ const root=mkdtempSync(join(tmpdir(),'diffwrite-launch-'));
+ t.after(()=>rmSync(root,{recursive:true,force:true}));
+ const env={LOCALAPPDATA:root},directory=join(root,'Diffwrite');mkdirSync(directory);
+ assert.deepEqual(launchConfig(env),{data:directory,port:41732});
+ const file=join(directory,'launch.json'),data=join(root,'existing-review');
+ writeFileSync(file,JSON.stringify({dataDirectory:data,port:41731}));
+ assert.deepEqual(launchConfig(env),{data,port:41731});
+ assert.deepEqual(launchConfig({...env,DIFFWRITE_REVIEW_DATA:'isolated',DIFFWRITE_REVIEW_PORT:'43000'}),{data:'isolated',port:43000});
+ writeFileSync(file,'broken');assert.throws(()=>launchConfig(env));
+ assert.equal(launchConfig({...env,DIFFWRITE_REVIEW_DATA:'isolated',DIFFWRITE_REVIEW_PORT:'43000'}).port,43000);
+ writeFileSync(file,JSON.stringify({dataDirectory:'relative'}));assert.throws(()=>launchConfig(env));
+ writeFileSync(file,JSON.stringify({port:65536}));assert.throws(()=>launchConfig(env));
+});

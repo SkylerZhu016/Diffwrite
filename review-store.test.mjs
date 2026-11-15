@@ -6,7 +6,8 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createHash,createCipheriv,randomBytes} from 'node:crypto';
 import {openStore} from './review-store.mjs';
-import {createDraft,annotatedChanges} from './model.mjs';
+import {createDraft,annotatedChanges,annotatedText,revisedText,pieces,parseAnnotated,applyImportedEdits,restoreDraft} from './model.mjs';
+import {editorLayout,spliceEditorText} from './editor-text.mjs';
 
 function setup(t){
   const dir=mkdtempSync(join(tmpdir(),'diffwrite-store-test-')), store=openStore(dir);
@@ -517,4 +518,147 @@ test('automation settings can apply and restore prompts without touching the cre
   assert.equal(preview.config.apiKey,'private-key');
   assert.equal(preview.config.prompt,'仅试跑');
   assert.equal(s.automationOpinion(a).prompt,'原提示词');
+});
+
+test('annotated paste keeps the draft ID, shifts review identities, and can undo or redo',t=>{
+  const s=setup(t), ai=s.createConnection('审稿 AI');
+  const {id}=s.publish({requestId:'paste-base',title:'连续稿',text:'甲句。乙句。',format:'plain'});
+  edit(s,ai,id,'paste-note',[{sentence:1,original:'乙句。',opinion:'旧意见'}]);
+  const before=s.read(id);
+  s.notify(id,before.meta.revision,ai);
+  const request={revision:before.meta.revision,text:'新句。 <意见：新意见> <改为：新改。>',start:3,end:3};
+  const after=s.pasteReview(id,request);
+  assert.equal(after.meta.id,id);
+  assert.equal(s.list().length,1);
+  assert.equal(revisedText(after.draft),'甲句。新改。乙句。');
+  assert.equal([...pieces(after.draft,false,true)].map(x=>x[1]).join(''),'甲句。乙句。');
+  assert.equal(after.draft.notes[1].opinion,'新意见');
+  assert.equal(after.draft.notes[2].opinion,'旧意见');
+  assert.deepEqual(after.draft.aiMarks,{2:{opinion:0}});
+  assert.throws(()=>s.pasteReview(id,request),/稿件已更新/);
+  assert.throws(()=>s.saveBrowser(after.meta,{...after.draft,insertions:[]}),/不能覆盖/);
+  const notice=s.notify(id,after.meta.revision,ai);
+  // Restoring an annotated fragment is an import, not a fresh review request.
+  assert.equal(notice.structureChanged,undefined);
+  assert.equal(notice.queued,false);
+  const undo=s.pasteReview(id,{revision:after.meta.revision,token:after.token,action:'undo'});
+  assert.deepEqual(undo.draft,before.draft);
+  const redo=s.pasteReview(id,{revision:undo.meta.revision,token:after.token,action:'redo'});
+  assert.deepEqual(redo.draft,after.draft);
+});
+test('paragraph break creates an undoable empty slot without changing the original snapshot or AI indices',t=>{
+  const s=setup(t),ai=s.createConnection('审稿模型');
+  const {id}=s.publish({requestId:'paragraph-base',title:'分段测试',text:'甲句。乙句。\r\n丙句。',format:'plain'});
+  let record=s.read(id);
+  record.draft.notes[0]={opinion:'甲句意见',revision:'甲句。\n'};
+  record.draft.notes[2]={opinion:'丙句意见',revision:''};
+  let saved=s.saveBrowser(record.meta,record.draft,true);
+  const notified=s.notify(id,saved.meta.revision,ai);
+  assert.equal(notified.queued,true);
+  s.ack(notified.id,ai);
+  const settings=s.saveOpinionSettings({baseUrl:'http://127.0.0.1:1/v1',model:'fixture',prompt:'意见测试'});
+  const prepared=s.prepareOpinion(id,{sentence:2,revision:saved.meta.revision,prefix:'丙句意见'});
+  assert.ok(prepared);
+  const run=s.finishOpinion(id,2,prepared,'补一句建议');
+  assert.equal(run.run.sentence,2);
+
+  const request={revision:saved.meta.revision,sentence:0,requestId:'break-once'};
+  const after=s.paragraphBreak(id,request);
+  assert.equal(after.meta.revision,saved.meta.revision+1);
+  assert.equal(after.draft.source,'甲句。\r\n\r\n乙句。\r\n丙句。');
+  assert.deepEqual(after.draft.insertedSlots,[1]);
+  assert.deepEqual(after.draft.spans[1],[7,7]);
+  assert.equal(after.draft.notes[0].opinion,'甲句意见');
+  assert.equal(after.draft.notes[0].revision,'');
+  assert.equal(after.draft.notes[3].opinion,'丙句意见');
+  assert.equal(s.currentOpinions(id)[0].sentence,3);
+  assert.equal([...pieces(after.draft,false,true)].map(piece=>piece[1]).join(''),'甲句。乙句。\r\n丙句。');
+  assert.equal(revisedText(after.draft),'甲句。\r\n\r\n乙句。\r\n丙句。');
+
+  // A retry with the same requestId returns the committed response, not a second split.
+  assert.deepEqual(s.paragraphBreak(id,request),after);
+  const notice=s.notify(id,after.meta.revision,ai);
+  assert.equal(notice.structureChanged,true);
+  assert.equal(notice.changeCount,2);
+  assert.deepEqual(s.readNotice(notice.id,0,10,ai).changes.map(change=>change.sentence),[0]);
+
+  const undo=s.pasteReview(id,{revision:after.meta.revision,token:after.token,action:'undo'});
+  assert.deepEqual(undo.draft,saved.draft);
+  const redo=s.pasteReview(id,{revision:undo.meta.revision,token:after.token,action:'redo'});
+  assert.deepEqual(redo.draft,after.draft);
+  assert.throws(()=>s.paragraphBreak(id,{...request,requestId:'stale-break'}),/已更新/);
+  assert.equal(settings.model,'fixture');
+});
+test('a committed empty slot accepts its first text independently and survives a JSON backup',t=>{
+  const s=setup(t),{id}=s.publish({requestId:'slot-base',title:'空段落',text:'尾句。\r\n\r\n',format:'plain'});
+  const initial=s.read(id),first={...initial.draft,notes:{0:{opinion:'拆出后补写',revision:'尾句。\n'}}};
+  const saved=s.saveBrowser(initial.meta,first,true),broken=s.paragraphBreak(id,{revision:saved.meta.revision,sentence:0,requestId:'slot-break'});
+  const emptyLine=structuredClone(broken.draft);
+  emptyLine.notes[1]={opinion:'',revision:'\r\n',literalWhitespace:true};
+  const firstEnter=s.saveBrowser(broken.meta,emptyLine,true);
+  const second= s.paragraphBreak(id,{revision:firstEnter.meta.revision,sentence:1,requestId:'second-empty-slot'});
+  assert.deepEqual(second.draft.insertedSlots,[1,2]);
+  assert.equal(second.draft.notes[1],undefined);
+  assert.equal(second.draft.spans[2][0],second.draft.spans[2][1]);
+  const edited=structuredClone(second.draft);
+  edited.notes[1]={opinion:'新段自己的意见',revision:'新段正文。\r\n'};
+  const savedSlot=s.saveBrowser(second.meta,edited,true);
+  const third=s.paragraphBreak(id,{revision:savedSlot.meta.revision,sentence:1,requestId:'third-empty-slot'});
+  assert.deepEqual(third.draft.insertedSlots,[1,2,3]);
+  assert.deepEqual(third.draft.spans[2],[11,11]);
+  assert.equal(third.draft.notes[1].opinion,'新段自己的意见');
+  assert.equal(third.draft.notes[1].revision,'新段正文。');
+  assert.equal(third.draft.notes[0].opinion,'拆出后补写');
+  assert.equal(revisedText(third.draft),'尾句。\r\n\r\n新段正文。\r\n\r\n\r\n\r\n\r\n\r\n');
+  assert.equal([...pieces(third.draft,false,true)].map(piece=>piece[1]).join(''),'尾句。\r\n\r\n');
+  const restored=restoreDraft(JSON.parse(JSON.stringify(third.draft)));
+  assert.deepEqual(restored.insertedSlots,[1,2,3]);
+  const backup=s.saveBrowser({id:'slot-backup',revision:0,kind:'backup'},restored,true);
+  assert.deepEqual(backup.draft.insertedSlots,[1,2,3]);
+  const edits=parseAnnotated(annotatedText(third.draft));
+  const annotated=applyImportedEdits(createDraft('TXT/MD 回导',edits.source),edits);
+  assert.deepEqual(annotated.insertedSlots,[1,2,3]);
+  assert.deepEqual(annotated.notes[1],third.draft.notes[1]);
+  assert.equal(revisedText(annotated),revisedText(third.draft));
+});
+test('purging a draft redacts its idempotent paragraph-break replay payload',t=>{
+  const dir=mkdtempSync(join(tmpdir(),'diffwrite-paragraph-purge-')),s=openStore(dir);
+  t.after(()=>{s.close();rmSync(dir,{recursive:true,force:true});});
+  const {id}=s.publish({requestId:'purge-base',title:'可删除',text:'尾句。'}),record=s.read(id);
+  record.draft.notes[0]={opinion:'',revision:'尾句。\n'};
+  const saved=s.saveBrowser(record.meta,record.draft,true),broken=s.paragraphBreak(id,
+    {revision:saved.meta.revision,sentence:0,requestId:'purge-break'});
+  const trashed=s.setTrash(id,broken.meta.revision,true);
+  s.purge([{id,revision:trashed.revision}]);
+  const db=new DatabaseSync(join(dir,'review.sqlite'));
+  try{
+    const replay=db.prepare('SELECT input,result FROM operations WHERE key=?').get(`paragraph-break:${id}:purge-break`);
+    assert.equal(replay.input,'');
+    assert.equal(replay.result,'{"purged":true}');
+  }finally{db.close();}
+});
+test('cross-paragraph deletion can merge whitespace across a slot, save, and undo cleanly',t=>{
+  const s=setup(t),{id}=s.publish({requestId:'cross-slot-base',title:'跨段删',text:'甲句。\r\n\r\n乙句。',format:'plain'});
+  const initial=s.read(id);
+  initial.draft.notes[0]={opinion:'',revision:'甲句。\n'};
+  const saved=s.saveBrowser(initial.meta,initial.draft,true);
+  const broken=s.paragraphBreak(id,{revision:saved.meta.revision,sentence:0,requestId:'cross-slot-break'});
+  const before=structuredClone(broken.draft),layout=editorLayout(before);
+  const {updates,gaps}=spliceEditorText(before,layout,0,layout.text.length,'');
+  assert.deepEqual(gaps,[[3,11]]);
+  const changed=restoreDraft({...before,notes:{...before.notes,...Object.fromEntries(updates)},omittedGaps:gaps});
+  const after=s.saveBrowser(broken.meta,changed,true);
+  assert.deepEqual(after.draft.omittedGaps,[[3,11]]);
+  assert.equal(revisedText(after.draft),'');
+  assert.equal(editorLayout(after.draft).text,revisedText(after.draft));
+
+  // The local undo restores the prior notes and gap set through the normal browser-save path.
+  const undo=structuredClone(after.draft);
+  for(const i of updates.keys()){
+    if(before.notes[i])undo.notes[i]=before.notes[i];else delete undo.notes[i];
+  }
+  if(before.omittedGaps)undo.omittedGaps=before.omittedGaps;else delete undo.omittedGaps;
+  const undone=s.saveBrowser(after.meta,undo,true);
+  assert.deepEqual(undone.draft,before);
+  assert.equal(revisedText(undone.draft),revisedText(before));
 });

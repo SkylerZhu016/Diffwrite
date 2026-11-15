@@ -153,12 +153,21 @@ export function restoreDraft(raw) {
   if (!raw || raw.version !== 1 || typeof raw.name !== 'string' || typeof raw.source !== 'string' ||
       !raw.source.trim() || !Array.isArray(raw.spans) || !raw.spans.length ||
       !raw.notes || typeof raw.notes !== 'object' || Array.isArray(raw.notes)) bad();
+  if(raw.insertedSlots!==undefined&&!Array.isArray(raw.insertedSlots))bad();
+  const insertedSlots=raw.insertedSlots??[];
+  let previousSlot=-1;
+  for(const index of insertedSlots){
+    if(!Number.isSafeInteger(index)||index<=previousSlot||index<0||index>=raw.spans.length||
+      !Array.isArray(raw.spans[index])||raw.spans[index][0]!==raw.spans[index][1])bad();
+    previousSlot=index;
+  }
+  const slotSet=new Set(insertedSlots);
   let last = 0;
-  for (const span of raw.spans) {
+  for (const [index,span] of raw.spans.entries()) {
     if (!Array.isArray(span) || span.length !== 2 || !span.every(Number.isSafeInteger)) bad();
     const [a,b] = span;
-    if (a < last || b <= a || b > raw.source.length || raw.source.slice(last,a).trim() ||
-        !raw.source.slice(a,b).trim()) bad();
+    if (a < last || b < a || b > raw.source.length || raw.source.slice(last,a).trim() ||
+        (b===a ? !slotSet.has(index) : slotSet.has(index)||!raw.source.slice(a,b).trim())) bad();
     last = b;
   }
   if (raw.source.slice(last).trim()) bad();
@@ -168,6 +177,7 @@ export function restoreDraft(raw) {
         typeof value.opinion !== 'string' || typeof value.revision !== 'string') bad();
     const auto=value.autoOpinion;
     notes[key] = {opinion:value.opinion, revision:value.revision, ...(value.deleted === true ? {deleted:true} : {}),
+      ...(value.literalWhitespace===true&&value.revision&&!value.revision.trim()?{literalWhitespace:true}:{}),
       ...(auto&&typeof auto.id==='string'&&/^[a-zA-Z0-9_-]{1,100}$/.test(auto.id)&&typeof auto.suffix==='string'&&auto.suffix.trim()&&auto.suffix.length<=600
         ?{autoOpinion:{id:auto.id,suffix:auto.suffix}}:{})};
   }
@@ -179,9 +189,23 @@ export function restoreDraft(raw) {
       if(!Array.isArray(gap)||gap.length!==2||!gap.every(Number.isSafeInteger))bad();
       const [a,b]=gap;
       if(a<end||a>=b||b>raw.source.length||raw.source.slice(a,b).trim())bad();
-      while(index<raw.spans.length&&raw.spans[index][1]<=a)index++;
+      while(index<raw.spans.length&&(raw.spans[index][1]<=a||raw.spans[index][0]===raw.spans[index][1]))index++;
       if(raw.spans[index]?.[0]<b)bad();
       omittedGaps.push([a,b]);end=b;
+    }
+  }
+  const insertions=[];
+  if(raw.insertions!==undefined){
+    if(!Array.isArray(raw.insertions))bad();
+    let previous=0,i=0;
+    for(const range of raw.insertions){
+      if(!Array.isArray(range)||range.length!==2||!range.every(Number.isSafeInteger))bad();
+      const [a,b]=range;
+      if(a<previous||a>=b||b>raw.source.length)bad();
+      while(raw.spans[i]?.[1]<=a)i++;
+      if(raw.spans[i]?.[0]<a)bad();
+      while(raw.spans[i]?.[0]<b){if(raw.spans[i][1]>b)bad();i++;}
+      insertions.push([a,b]);previous=b;
     }
   }
   // AI 审稿 tags. opinion: offset where the AI-written part of the opinion starts (0 = all of it);
@@ -202,6 +226,8 @@ export function restoreDraft(raw) {
   const notices = Array.isArray(raw.notices) ? raw.notices.filter(x => typeof x === 'string') : [];
   return {version:1, name:raw.name, source:raw.source, spans:raw.spans, notes, notices,
     ...(omittedGaps.length?{omittedGaps}:{}),
+    ...(insertions.length?{insertions}:{}),
+    ...(insertedSlots.length?{insertedSlots}:{}),
     ...(Object.keys(aiMarks).length?{aiMarks}:{}),
     ...(['markdown','plain'].includes(raw.format) ? {format:raw.format} : {})};
 }
@@ -211,18 +237,29 @@ export const deleted = (d,i) => d.notes[i]?.deleted === true;
 export const modified = (d,i) => {
   if (deleted(d,i)) return true;
   const rev = d.notes[i]?.revision;
-  return Boolean(rev?.trim() && rev !== original(d,i));
+  return Boolean(rev && (rev.trim()||d.notes[i]?.literalWhitespace) && rev !== original(d,i));
 };
 export const revised = (d,i) => deleted(d,i) ? '' : modified(d,i) ? d.notes[i].revision : original(d,i);
 
-export function* pieces(d, useRevisions = false) {
+function originalGap(d,start,end){
+  let out='',at=start;
+  for(const [a,b] of d.insertions??[]){
+    if(b<=at)continue;
+    if(a>=end)break;
+    if(a>at)out+=d.source.slice(at,a);
+    at=Math.min(b,end);
+  }
+  return out+d.source.slice(at,end);
+}
+export function* pieces(d, useRevisions = false, originalOnly = false) {
   let end = 0;
   for (const [i,[a,b]] of d.spans.entries()) {
-    if (a > end) {const gap=d.source.slice(end,a);yield [null,useRevisions?deletedGap(gap,end,d,false):gap];}
-    yield [i, useRevisions ? revised(d,i) : original(d,i)];
+    if (a > end) {const gap=d.source.slice(end,a);yield [null,useRevisions?deletedGap(gap,end,d,false):originalOnly?originalGap(d,end,a):gap];}
+    if(!originalOnly||!d.insertions?.some(([start,stop])=>start<=a&&b<=stop))
+      yield [i, useRevisions ? revised(d,i) : original(d,i)];
     end = b;
   }
-  if (end < d.source.length) {const gap=d.source.slice(end);yield [null,useRevisions?deletedGap(gap,end,d,false):gap];}
+  if (end < d.source.length) {const gap=d.source.slice(end);yield [null,useRevisions?deletedGap(gap,end,d,false):originalOnly?originalGap(d,end,d.source.length):gap];}
 }
 
 export const revisedText = d => Array.from(pieces(d,true), p => p[1]).join('');
@@ -290,7 +327,7 @@ export function withoutEditedAiMarks(marks,base,edited){
       const from=editedOpinionMark(kept.opinion,a.opinion??'',b.opinion??'');
       if(from===undefined)delete kept.opinion;else kept.opinion=from;
     }
-    if((a.revision??'')!==(b.revision??'')||Boolean(a.deleted)!==Boolean(b.deleted)){delete kept.body;delete kept.replaced;}
+    if((a.revision??'')!==(b.revision??'')||Boolean(a.deleted)!==Boolean(b.deleted)||Boolean(a.literalWhitespace)!==Boolean(b.literalWhitespace)){delete kept.body;delete kept.replaced;}
     if(Object.keys(kept).length)next[i]=kept;
   }
   return next;
@@ -306,7 +343,9 @@ function annotatedSentence(text,mark,opinions){
   const inline=deletionOnly(text,mark.revision);
   return inline!==null?inline+comment:text+comment+' <改为：'+escapedMarkup(mark.revision)+'>';
 }
-function* annotatedPieces(d,onlyChanges=false){
+const splitTag='<!--diffwrite:split-->';
+const slotTag='<!--diffwrite:slot-->';
+function* annotatedPieces(d,onlyChanges=false,explicitSpans=false){
   let offset=0;
   for(const [i,text] of pieces(d)){
     const at=offset;offset+=text.length;
@@ -314,11 +353,15 @@ function* annotatedPieces(d,onlyChanges=false){
     const mark=reviewMark(d,i);
     // An opinion written entirely by AI is labelled in the output; appended AI parts already carry the label.
     const opinions=mark.opinion?[(d.aiMarks?.[i]?.opinion===0?aiOpinionLabel:'')+mark.opinion]:[];
-    if(!onlyChanges||hasReviewMark(mark))yield {text:annotatedSentence(text,mark,opinions)};
+    if(!onlyChanges||hasReviewMark(mark)){
+      const rendered=annotatedSentence(text,mark,opinions);
+      yield {text:(d.insertedSlots?.includes(i)?slotTag:'')+(explicitSpans?splitTag+rendered+splitTag:rendered)};
+    }
   }
 }
-export function annotatedText(d){
-  return Array.from(annotatedPieces(d),p=>p.text).join('');
+export function annotatedText(d,naturalSpans=splitSentences(d.source)){
+  const explicit=Boolean(d.insertions?.length||d.insertedSlots?.length)&&JSON.stringify(d.spans)!==JSON.stringify(naturalSpans);
+  return Array.from(annotatedPieces(d,false,explicit),p=>p.text).join('').replaceAll(splitTag+splitTag,splitTag);
 }
 export function annotatedChanges(d){
   const changed=[], gaps=d.omittedGaps??[];
@@ -335,34 +378,69 @@ export function annotatedChanges(d){
   return changed.join('\n');
 }
 export function parseAnnotated(input){
-  const matches=[...input.matchAll(/<del>|<\/del>|[ \t]?<(意见|改为)[：:]([^>]*)>|【(意见|改版)[：:]([^】]*)】|【删除】/gu)];
+  const matches=[...input.matchAll(/<!--diffwrite:(?:split|slot)-->|<del>|<\/del>|[ \t]?<(意见|改为)[：:]([^>]*)>|【(意见|改版)[：:]([^】]*)】|【删除】/gu)];
   if(!matches.length)return {source:input,markers:[],removed:[]};
   const valid=new Set(),stack=[];
   for(const m of matches){
     if(m[0]==='<del>')stack.push(m.index);
     else if(m[0]==='</del>'&&stack.length){valid.add(stack.pop());valid.add(m.index);}
   }
-  let source='',last=0,depth=0,start=0;
-  const markers=[],removed=[];
+  let source='',last=0,depth=0,start=0,activeSlot=null;
+  const markers=[],removed=[],boundaries=[],slots=[];
   for(const m of matches){
     const token=m[0];
     if((token==='<del>'||token==='</del>')&&!valid.has(m.index))continue;
-    source+=input.slice(last,m.index);
+    const plain=input.slice(last,m.index);
+    source+=plain;
+    if(plain)activeSlot=null;
     last=m.index+token.length;
-    if(token==='<del>'){if(depth++===0)start=source.length;}
+    if(token===splitTag)boundaries.push(source.length);
+    else if(token===slotTag){activeSlot=slots.length;slots.push({at:source.length});}
+    else if(token==='<del>'){if(depth++===0)start=source.length;}
     else if(token==='</del>'){if(--depth===0&&start<source.length)removed.push([start,source.length]);}
     else if(token==='【删除】')markers.push({at:source.length,key:'deleted',value:true});
     else markers.push({at:source.length,key:(m[1]??m[3])==='意见'?'opinion':'revision',
-      value:m[1]?decodedMarkup(m[2]):m[4]});
+      value:m[1]?decodedMarkup(m[2]):m[4],...(activeSlot===null?{}:{slot:activeSlot})});
   }
-  return {source:source+input.slice(last),markers,removed};
+  return {source:source+input.slice(last),markers,removed,...(boundaries.length?{boundaries}:{}),...(slots.length?{slots}:{})};
 }
 export function applyImportedEdits(d,edits){
+  if(edits.boundaries?.length||edits.markers.length){
+    const explicit=edits.boundaries?.length, cuts=new Set([0,d.source.length]);
+    if(explicit)for(const edge of edits.boundaries)cuts.add(edge);
+    else{
+      const marks=[...new Set(edits.markers.map(m=>m.at))];
+      for(const edge of marks)cuts.add(edge);
+      let next=0;
+      for(const edge of d.spans.flat()){
+        while(marks[next]<=edge)next++;
+        // A tag belongs after its sentence, including closing Markdown delimiters.
+        if(marks[next]-edge<=16&&/^[*_~\x60]+$/.test(d.source.slice(edge,marks[next])))continue;
+        cuts.add(edge);
+      }
+    }
+    const sorted=[...cuts].sort((a,b)=>a-b);
+    d.spans=sorted.slice(1).flatMap((b,i)=>{
+      const a=sorted[i],part=d.source.slice(a,b);
+      return part.trim()?[[b-part.trimStart().length,a+part.trimEnd().length]]:[];
+    });
+  }
+  const slotIndices=[];
+  for(const slot of edits.slots??[]){
+    if(!Number.isSafeInteger(slot.at)||slot.at<0||slot.at>d.source.length)throw new Error('带注空句位置无效。');
+    if(d.spans.some(([a,b])=>a<slot.at&&slot.at<b))throw new Error('带注空句不能位于句子正文中间。');
+    const index=d.spans.filter(([,b])=>b<=slot.at).length;
+    d.spans.splice(index,0,[slot.at,slot.at]);
+    slotIndices.push(index);
+  }
+  if(slotIndices.length)d.insertedSlots=[...(d.insertedSlots??[]).map(i=>i+slotIndices.filter(n=>n<=i).length),...slotIndices]
+    .sort((a,b)=>a-b);
   if(!edits.markers.length&&!edits.removed.length)return d;
   function set(i,key,value){
     const n=d.notes[i]??={opinion:'',revision:''};
     if(key==='opinion'&&n.opinion) n.opinion+='\n'+value;
     else n[key]=value;
+    if(key==='revision'){if(value&&!value.trim())n.literalWhitespace=true;else delete n.literalWhitespace;}
   }
   const gaps=[];
   for(const [from,to] of edits.removed){
@@ -381,7 +459,7 @@ export function applyImportedEdits(d,edits){
     if(ranges.length)d.notes[i]=deleteTextRanges(d,i,ranges,false);
   }
   for(const marker of edits.markers){
-    const index=d.spans.findLastIndex(([a])=>a<marker.at);
+    const index=Number.isSafeInteger(marker.slot)?slotIndices[marker.slot]:d.spans.findLastIndex(([a])=>a<marker.at);
     if(index>=0)set(index,marker.key,marker.value);
   }
   return d;
@@ -399,7 +477,10 @@ export function deleteTextRanges(d,i,ranges,useRevision) {
     end = b;
   }
   result += source.slice(end);
-  return result.trim() ? {...existing,revision:result} : {...existing,deleted:true};
+  if(!result)return {...existing,deleted:true};
+  const note={...existing,revision:result};
+  if(!result.trim())note.literalWhitespace=true;else delete note.literalWhitespace;
+  return note;
 }
 
 // Replay edits made against base over the latest record. The caller determines when
@@ -422,8 +503,9 @@ export function mergeDraftEdits(base,local,latest){
       c.opinion=opinion;
       if(from!==undefined)(marks[i]??={}).opinion=from;
     }
-    if((a.revision??'')!==(b.revision??'')||Boolean(a.deleted)!==Boolean(b.deleted)){
+    if((a.revision??'')!==(b.revision??'')||Boolean(a.deleted)!==Boolean(b.deleted)||Boolean(a.literalWhitespace)!==Boolean(b.literalWhitespace)){
       c.revision=b.revision??'';
+      if(b.literalWhitespace)c.literalWhitespace=true;else delete c.literalWhitespace;
       if(b.deleted)c.deleted=true;else delete c.deleted;
     }
     if(!equal(a.autoOpinion,b.autoOpinion)){

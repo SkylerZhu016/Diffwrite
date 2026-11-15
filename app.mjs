@@ -1,17 +1,21 @@
+import {setupInlineText} from './inline-text.mjs';
+import {editorLayout, textareaText, rawOffset, textEdit, sentenceAt, spliceEditorText} from './editor-text.mjs';
 import {fineChanges} from './changes.mjs';
-import {createDraft, restoreDraft, original, modified, revised, effectiveOpinion, mergeDraftEdits, pieces, revisedText, annotatedText, annotatedChanges, deleted, deleteTextRanges, parseAnnotated, applyImportedEdits, editedOpinionMark} from './model.mjs';
+import {createDraft, restoreDraft, original, modified, revised, effectiveOpinion, mergeDraftEdits, pieces, revisedText, annotatedText, annotatedChanges, deleted, parseAnnotated, applyImportedEdits, editedOpinionMark} from './model.mjs';
 import {setupOpinionUI} from './opinion-ui.mjs';
 import {readDocx} from './docx.mjs';
 import {saveRecord, readRecord, listRecords, listDeletedRecords, forgetPurged, recoverLegacy, migrateHistory, reviewApi, HistoryConflict} from './history.mjs';
 import {markdownSpans, renderMarkdown, looksLikeMarkdown} from './markdown.mjs';
 
 const $ = id => document.getElementById(id);
-const manuscript = $('manuscript'), reading = $('reading-body');
+const manuscript = $('manuscript'), reading = $('reading-body'), bodyEditor=$('body-editor');
+let pasteCaret=null, bodyUndo=[], bodyRedo=[], displayOffsets=new WeakMap(), displaySentences=[],renderPoints=[],ghostRanges=[];
+setupInlineText(bodyEditor);
 const opinion = $('opinion'), revision = $('revision'), tabs = [...document.querySelectorAll('[data-mode]')];
 const legacyKey = 'diffwrite.sentence-review.v1';
 let draft = null, mode = 'split', selected = null, cursor = 0, cells = new Map(), active = null;
 let renderSource = false, renderTimer = 0, markdownMode = false;
-let cellOffsets = new WeakMap(), textOffsets = new WeakMap();
+let cellOffsets = new WeakMap();
 let showChanges=true, changeDetail='inline';
 try{
   const pref=JSON.parse(localStorage.getItem('diffwrite-changes'));
@@ -19,11 +23,10 @@ try{
   if(['inline','full','sentence'].includes(pref?.detail))changeDetail=pref.detail;
 }catch{}
 let generation = 0, savedGeneration = 0, saveInFlight = null;
-let timer = 0, busy = false, switching = false;
+let timer = 0, busy = false, switching = false, paragraphPending = null;
 
-function notice(text = '') {
-  $('notice').textContent = text;
-  $('notice').hidden = !text;
+function notice(text = '', failed = false) {
+  outputStatus(text, failed);
 }
 
 function saveLabel(label, failed = false) {
@@ -65,7 +68,7 @@ function persist() {
       saveLabel('未保存',true);
       notice(error instanceof HistoryConflict
         ? '另一个窗口已经更新这份稿件。请先导出当前审稿备份，再刷新页面。'
-        : '无法写入本地历史。可以重试，或先导出审稿备份。');
+        : '无法写入本地历史。可以重试，或先导出审稿备份。', true);
       return false;
     })
     .finally(() => {saveInFlight = null;});
@@ -82,11 +85,11 @@ function scheduleSave() {
   timer = setTimeout(persist,160);
 }
 $('retry').onclick = async () => {
-  if (await flush()) notice(draft?.notices.join(' ') ?? '');
+  if (await flush()) notice();
 };
 document.addEventListener('visibilitychange', () => {if (document.hidden) flush();});
 window.addEventListener('beforeunload', event => {
-  if (!isDirty()) return;
+  if (!isDirty() && !paragraphPending) return;
   flush();
   event.preventDefault();
   event.returnValue = '';
@@ -106,9 +109,10 @@ function isMarkdown() {
 }
 const cellAt = i => cells.get(i)?.[0];
 function addCell(parent,i,value,start=null) {
-  if (!value) return;
+  if (!value && !(mode!=='source'&&draft.insertedSlots?.includes(i)&&!deleted(draft,i))) return;
   const span = document.createElement('span');
   span.className = 'sentence';
+  if(!value){span.classList.add('empty-sentence');span.setAttribute('aria-label','新增段落');}
   span.dataset.index = i;
   span.dataset.changed = modified(draft,i);
   span.dataset.deleted = mode!=='source'&&deleted(draft,i);
@@ -123,12 +127,69 @@ function addCell(parent,i,value,start=null) {
     span.setAttribute('role','button');
     span.setAttribute('aria-pressed',String(i === selected));
     span.tabIndex = -1;
-    if (isMarkdown() && !renderSource) span.setAttribute('aria-label',original(draft,i));
+    if (value && isMarkdown() && !renderSource) span.setAttribute('aria-label',original(draft,i));
   }
   cells.get(i).push(span);
-  span.textContent = value;
-  if(start!==null)textOffsets.set(span.firstChild,start);
+  span.append(document.createTextNode(value));
   parent.append(span);
+  return span.firstChild;
+}
+function placeEmptySentences(fragment,slots,source){
+  const makeAnchor=(i,at)=>{
+    const temporary=document.createDocumentFragment(),node=addCell(temporary,i,'',0);
+    if(!node)return null;
+    displayOffsets.set(node,{start:at,end:at});
+    return node.parentElement;
+  };
+  const gaps=[...fragment.querySelectorAll('.md-gap')],handled=new Set();
+  for(const gap of gaps){
+    const from=Number(gap.dataset.start),to=Number(gap.dataset.end);
+    const inside=slots.filter(([i,at])=>!handled.has(i)&&at>=from&&at<=to);
+    if(!inside.length)continue;
+    const out=document.createDocumentFragment();let cursor=from;
+    const appendGap=(a,b)=>{
+      const raw=source.slice(a,b),breaks=[...raw.matchAll(/\r\n|\r|\n/g)];
+      if(breaks.length<2)return;
+      const first=breaks[0],start=a+first.index+first[0].length;
+      const el=document.createElement('span');el.className='md-gap';
+      el.dataset.start=a;el.dataset.end=b;el.style.height=(breaks.length-1)+'lh';
+      const node=document.createTextNode(source.slice(start,b));el.append(node);out.append(el);
+      displayOffsets.set(node,{start,end:b});
+    };
+    for(const [i,at] of inside){
+      appendGap(cursor,at);const anchor=makeAnchor(i,at);
+      if(anchor){
+        if(at===to&&gap.nextElementSibling){
+          const next=gap.nextElementSibling;
+          const first=next.querySelector('.sentence');
+          if(first)first.before(anchor);else next.prepend(anchor);
+        }else{
+          const paragraph=document.createElement('p');paragraph.className='new-paragraph';
+          paragraph.append(anchor);out.append(paragraph);
+        }
+      }
+      cursor=at;handled.add(i);
+    }
+    appendGap(cursor,to);gap.replaceWith(out);
+  }
+  for(const [i,at] of slots){
+    if(handled.has(i))continue;
+    const anchor=makeAnchor(i,at);if(!anchor)continue;
+    const walker=document.createTreeWalker(fragment,NodeFilter.SHOW_TEXT);let placed=false;
+    for(let node;(node=walker.nextNode());){
+      const map=displayOffsets.get(node);
+      if(!map||map.atomic||map.positions||at<map.start||at>map.end)continue;
+      const offset=at-map.start,parent=node.parentElement;
+      if(offset===0&&parent.classList.contains('sentence'))parent.before(anchor);
+      else if(offset===node.length&&parent.classList.contains('sentence'))parent.after(anchor);
+      else{
+        const right=node.splitText(offset);displayOffsets.set(node,{...map,end:at});displayOffsets.set(right,{...map,start:at});
+        right.before(anchor);
+      }
+      placed=true;break;
+    }
+    if(!placed){const paragraph=document.createElement('p');paragraph.className='new-paragraph';paragraph.append(anchor);fragment.append(paragraph);}
+  }
 }
 function markdownDecorator(ranges) {
   function nextRange(offset) {
@@ -140,35 +201,44 @@ function markdownDecorator(ranges) {
     return lo;
   }
   return (parent,value,a,b,offsets) => {
-    const write = (start,end,index,basis=null) => {
-      if(end<=start) return;
-      if(index===undefined) parent.append(document.createTextNode(value.slice(start,end)));
-      else addCell(parent,index,value.slice(start,end),basis);
+    const write = (start,end,index,basis=null,position=null) => {
+      if(end<=start)return;
+      const text=value.slice(start,end);
+      const node=index===undefined?parent.appendChild(document.createTextNode(text)):addCell(parent,index,text,basis);
+      if(position)displayOffsets.set(node,position);
     };
-    let k = nextRange(a);
-    if (offsets === null) {
-      write(0,value.length,ranges[k]?.[0]<b ? ranges[k][2] : undefined);
+    let k=nextRange(a);
+    if(offsets===null) {
+      const index=ranges[k]?.[0]<b?ranges[k][2]:undefined;
+      write(0,value.length,index,null,{start:a,end:b,atomic:true});
       return;
     }
-    if (!offsets) {
+    if(!offsets) {
       let start=a;
-      while(k<ranges.length && ranges[k][0]<b) {
-        const [from,to,i]=ranges[k++];
-        write(start-a,from-a);
-        write(Math.max(start,from)-a,Math.min(to,b)-a,i,Math.max(start,from)-from);
-        start=Math.min(to,b);
+      while(k<ranges.length&&ranges[k][0]<b) {
+        const [from,to,i]=ranges[k++], first=Math.max(start,from), last=Math.min(to,b);
+        write(start-a,from-a,undefined,null,{start,end:from});
+        write(first-a,last-a,i,first-from,{start:first,end:last});
+        start=last;
       }
-      write(start-a,b-a);
+      write(start-a,b-a,undefined,null,{start,end:b});
       return;
     }
-    let from=0, active;
-    for(let j=0;j<offsets.length;j++) {
+    let from=0,active;
+    const mapped=(first,last,index)=>{
+      if(last<=first)return;
+      const start=offsets[first],end=offsets[last]??b,positions=offsets.slice(first,last);
+      const contiguous=positions.every((p,i)=>p===start+i)&&end===start+positions.length;
+      write(first,last,index,contiguous&&index!==undefined?start-displaySentences[index].start:null,
+        contiguous?{start,end}:{start,end,positions});
+    };
+    for(let j=0;j<value.length;j++) {
       const offset=offsets[j];
-      while(k<ranges.length && ranges[k][1]<=offset) k++;
-      const index=ranges[k]?.[0]<=offset ? ranges[k][2] : undefined;
-      if(index!==active) {write(from,j,active);from=j;active=index;}
+      while(k<ranges.length&&ranges[k][1]<=offset)k++;
+      const index=ranges[k]?.[0]<=offset?ranges[k][2]:undefined;
+      if(index!==active){mapped(from,j,active);from=j;active=index;}
     }
-    write(from,value.length,active);
+    mapped(from,value.length,active);
   };
 }
 function decorateFineChanges(){
@@ -201,14 +271,18 @@ function decorateFineChanges(){
         for(const drop of drops.filter(d=>d.pos===pos)){
           const ghost=document.createElement('del');
           ghost.className='diff-removed';
+          ghost.contentEditable='false';
           ghost.textContent=drop.text;
           ghost.dataset.offset=drop.at;
+          const at=displaySentences[i].start+drop.at;
+          displayOffsets.set(ghost.firstChild,{start:at,end:at,atomic:true});
           out.append(ghost);
         }
         const next=cuts[index+1];
         if(next===undefined)continue;
         const live=document.createTextNode(value.slice(pos,next));
-        textOffsets.set(live,start+pos);
+        const absolute=displaySentences[i].start+start;
+        displayOffsets.set(live,{start:absolute+pos,end:absolute+next});
         if(adds.some(([a,b])=>pos>=a&&pos<b)){
           const add=document.createElement('ins');
           add.className='diff-added';add.append(live);out.append(add);
@@ -246,12 +320,15 @@ for(const input of document.querySelectorAll('input[name="change-detail"]'))inpu
 };
 
 function paintReading() {
-  clearTimeout(renderTimer);
+  if(inlineEdit?.composing||paragraphPending)return;
   finishInline(false);
+  clearTimeout(renderTimer);
   document.body.dataset.empty = !draft;
   const md = isMarkdown();
   const rendered = md && !renderSource;
   manuscript.dataset.view = mode;
+  manuscript.removeAttribute('contenteditable');
+  manuscript.setAttribute('role','document');
   manuscript.dataset.detail = mode==='split'&&showChanges?changeDetail:'none';
   syncChangeControls();
   manuscript.classList.toggle('md-rendered',rendered);
@@ -263,6 +340,7 @@ function paintReading() {
   $('inline-legend').hidden = !changeLegend || changeDetail==='sentence';
   $('removed-legend').hidden = changeDetail!=='full';
   $('foot-tip').hidden = mode !== 'split';
+  $('foot-tip').textContent='点击一句编辑源码 · 拖出编辑框可跨段选中删除';
   $('draft-name').textContent = draft?.name ?? '空白稿件';
   $('draft-name').title = draft?.name ?? '';
   $('export-menu').hidden = !draft;
@@ -275,7 +353,8 @@ function paintReading() {
   $('markdown-view').textContent = rendered ? '查看源码' : '渲染 Markdown';
   cells = new Map();
   cellOffsets = new WeakMap();
-  textOffsets = new WeakMap();
+  displayOffsets=new WeakMap();displaySentences=[];renderPoints=[];ghostRanges=[];
+  manuscript.tabIndex=draft&&mode==='split'?0:-1;
   syncTabs();
   if (!draft) {
     manuscript.replaceChildren();
@@ -284,25 +363,34 @@ function paintReading() {
   }
   const fragment = document.createDocumentFragment();
   const displayPieces = function*(){
-    for(const [i,value] of pieces(draft,mode!=='source')) {
+    for(const [i,value] of pieces(draft,mode!=='source',mode==='source')) {
       const showDeleted=mode!=='source'&&showChanges&&changeDetail!=='inline'&&i!==null&&deleted(draft,i);
       yield [i,showDeleted?original(draft,i):value];
     }
   };
-  if (rendered) {
-    const ranges=[], text=[];
-    let offset=0;
-    for (const [i,value] of displayPieces()) {
-      if (i!==null&&value.length) ranges.push([offset,offset+value.length,i]);
-      offset+=value.length;
+  let displayAt=0, cleanAt=0;
+  const ranges=[], text=[], emptySlots=[];
+  for(const [i,value] of displayPieces()) {
+    const ghost=mode==='split'&&i!==null&&deleted(draft,i);
+    const part={start:displayAt,end:displayAt+value.length,cleanStart:cleanAt,ghost};
+    if(i!==null)displaySentences[i]=part;
+    if(ghost&&value.length)ghostRanges.push({...part,omitted:displayAt-cleanAt});
+    if(rendered) {
+      if(i!==null&&value.length)ranges.push([part.start,part.end,i]);
+      else if(i!==null&&mode!=='source'&&draft.insertedSlots?.includes(i)&&!ghost)emptySlots.push([i,part.start]);
       text.push(value);
+    } else if(value || (i!==null&&mode!=='source'&&draft.insertedSlots?.includes(i)&&!ghost)) {
+      let node;
+      if(i===null){const gap=document.createElement('span');gap.className='text-gap';gap.dataset.start=part.start;gap.dataset.end=part.end;gap.textContent=value;fragment.append(gap);node=gap.firstChild;}
+      else node=addCell(fragment,i,value,0);
+      displayOffsets.set(node,part);
     }
+    displayAt=part.end;
+    if(!ghost)cleanAt+=value.length;
+  }
+  if(rendered){
     fragment.append(renderMarkdown(text.join(''),markdownDecorator(ranges)));
-  } else {
-    for (const [i,value] of displayPieces()) {
-      if (i===null) fragment.append(document.createTextNode(value));
-      else addCell(fragment,i,value,0);
-    }
+    placeEmptySentences(fragment,emptySlots,text.join(''));
   }
   if(mode!=='source'){
     decorateFineChanges();
@@ -322,11 +410,20 @@ function paintReading() {
     if (cellAt(cursor)) cellAt(cursor).tabIndex = 0;
   }
   manuscript.replaceChildren(fragment);
+  const walker=document.createTreeWalker(manuscript,NodeFilter.SHOW_TEXT);
+  for(let node;(node=walker.nextNode());){
+    const mapped=displayOffsets.get(node);
+    if(!mapped||node.parentElement.closest('.diff-removed,[data-deleted=true]'))continue;
+    renderPoints.push({node,mapped,start:cleanOffset(mapped.start),end:cleanOffset(mapped.end)});
+  }
   updateDeleteControls();
 }
 function repaintAtScroll(align = false) {
+  if(inlineEdit?.composing)return;
+  const range=!inlineEdit&&manuscript.contains(document.activeElement)?bodyRange():null;
   const offset = reading.scrollTop;
   paintReading();
+  if(range)restoreBodySelection(range);
   reading.scrollTop = offset;
   if (align) cellAt(selected)?.scrollIntoView({block:'nearest'});
 }
@@ -364,9 +461,12 @@ function paintEditor(focus = false) {
     opinionUI.render();
     return;
   }
-  $('quote-caption').textContent = isMarkdown() ? '原句 · Markdown 源码' : '原句';
+  const newParagraph=draft.insertedSlots?.includes(selected);
+  $('quote-caption').textContent = newParagraph?'新增段落':isMarkdown() ? '原句 · Markdown 源码' : '原句';
+  $('quote').hidden=Boolean(newParagraph);
+  $('restore-sentence').textContent=newParagraph?'清空本段':'恢复原句';
   $('revision-hint').textContent = deleted(draft,selected) ? '恢复本句后可编辑' :
-    isMarkdown() ? '按 Markdown 填写，留空沿用原句' : '留空则沿用原句';
+    newParagraph ? '本段单独保存，留空则保留空段' : isMarkdown() ? '按 Markdown 填写，留空沿用原句' : '留空则沿用原句';
   $('quote').textContent = original(draft,selected);
   const nextOpinion=draft.notes[selected]?.opinion??'', nextRevision=draft.notes[selected]?.revision??'';
   if(opinion.value!==nextOpinion)opinion.value=nextOpinion;
@@ -377,7 +477,7 @@ function paintEditor(focus = false) {
   if (focus) focusField();
 }
 function setMode(next) {
-  if (!draft || next === mode) return;
+  if (!draft || switching || next === mode) return;
   persist();
   const offset = reading.scrollTop;
   mode = next;
@@ -411,45 +511,370 @@ function select(index,focus=true) {
   }
   paintEditor(focus);
 }
-manuscript.addEventListener('click', event => {
-  if(mode==='source')return;
-  const cell = event.target.closest('.sentence');
-  if (!cell || selectionInside()) return;
-  const i=Number(cell.dataset.index),at=caretOffset(event,cell);
-  if(inlineEdit&&inlineEdit.i!==i)finishInline();
-  if(!cellAt(i))return;
-  select(i,false);
-  if(deleted(draft,i))opinion.focus({preventScroll:true});else startInline(i,cellAt(i),at);
-});
-manuscript.addEventListener('keydown', event => {
-  if(mode==='source')return;
-  const cell = event.target.closest('.sentence');
-  if (!cell) return;
-  const i = Number(cell.dataset.index);
-  if (event.key === 'Enter' || event.key === ' ') {
-    event.preventDefault();select(i,false);
-    if(deleted(draft,i))opinion.focus({preventScroll:true});else startInline(i,cell,undefined);
+let inlineEdit=null, pointerEdit=null, suppressClick=false;
+function bodyRange(){
+  if(inlineEdit)return [bodyEditor.selectionStart,bodyEditor.selectionEnd].map(at=>inlineEdit.start+rawOffset(inlineEdit.value,at));
+  const selection=window.getSelection();
+  if(!selection?.rangeCount)return null;
+  const range=selection.getRangeAt(0);
+  if(!manuscript.contains(range.startContainer)||!manuscript.contains(range.endContainer))return null;
+  if(!range.collapsed)return renderedSelection(range);
+  const at=domOffset(range.startContainer,range.startOffset);
+  return at===undefined?null:[at,at];
+}
+function bodyPoint(at){
+  let lo=0,hi=renderPoints.length;
+  while(lo<hi){const mid=(lo+hi)>>1;if(renderPoints[mid].end<at)lo=mid+1;else hi=mid;}
+  const candidates=renderPoints.slice(Math.max(0,lo-1),lo+2);
+  let best=null,distance=Infinity;
+  for(const {node,mapped,start} of candidates){
+    const omitted=mapped.start-start;
+    const consider=i=>{
+      const pos=(i===node.length?mapped.end:mapped.atomic?mapped.start:mapped.positions?.[i]??mapped.start+i)-omitted;
+      const diff=Math.abs(pos-at);if(diff<distance){best=[node,i];distance=diff;}
+    };
+    if(mapped.atomic){consider(0);consider(node.length);}
+    else if(mapped.positions){for(let i=0;i<=node.length&&distance;i++)consider(i);}
+    else consider(Math.max(0,Math.min(node.length,at-start)));
   }
-  if (['ArrowRight','ArrowLeft','ArrowDown','ArrowUp','Home','End'].includes(event.key)) {
+  return best??[manuscript,manuscript.childNodes.length];
+}
+function restoreBodySelection([start,end=start],focus=true){
+  if(focus)manuscript.focus({preventScroll:true});
+  const selection=window.getSelection();selection.setBaseAndExtent(...bodyPoint(start),...bodyPoint(end));
+}
+function mountSpanningEditor(parts,start,end,layout,context=false){
+  const rendered=isMarkdown()&&!renderSource;
+  if(!rendered&&!context)return null;
+  const rootOf=cell=>{let root=cell;while(root&&root.parentElement!==manuscript)root=root.parentElement;return root;};
+  const owned=new Set(parts.map(rootOf).filter(Boolean)),span=displaySentences[parts[0]?.dataset.index];
+  const bounds=root=>{
+    const sentence=displaySentences[root.dataset.index];
+    return [root.dataset.mdStart??root.dataset.start??sentence?.start,root.dataset.mdEnd??root.dataset.end??sentence?.end].map(n=>cleanOffset(Number(n)));
+  };
+  const roots=[...manuscript.children].filter(root=>{
+    const [a,b]=bounds(root);
+    return owned.has(root)||(context?a<end&&b>start:span&&a<cleanOffset(span.end)&&b>cleanOffset(span.start));
+  });
+  if(!roots.length||!context&&roots.length===1&&!roots[0].classList.contains('md-gap'))return null;
+  let first=roots[0],last=roots.at(-1);
+  // Include the neighbouring line when the sentence begins/ends inside a gap.
+  // A multiline editing host must never live inside that fixed-height spacer.
+  if(first.classList.contains('md-gap')&&first.previousElementSibling)first=first.previousElementSibling;
+  if(last.classList.contains('md-gap')&&last.nextElementSibling)last=last.nextElementSibling;
+  const from=Math.min(start,bounds(first)[0]),to=Math.max(end,bounds(last)[1]);
+  const box=document.createElement(rendered?'div':'span');box.className='inline-source-region';
+  const prefix=document.createTextNode(layout.text.slice(from,start)),suffix=document.createTextNode(layout.text.slice(end,to));
+  displayOffsets.set(prefix,{start:from,end:start,clean:true});
+  displayOffsets.set(suffix,{start:end,end:to,clean:true});
+  box.append(prefix,bodyEditor,suffix);
+  const nodes=[];for(let node=first;node;node=node.nextSibling){nodes.push(node);if(node===last)break;}
+  first.before(box);for(const node of nodes)node.remove();
+  return {box,nodes};
+}
+function startInline(start,end,element,index=null,caret=start,context=false){
+  if(!draft||mode!=='split'||switching)return;
+  finishInline();
+  const layout=editorLayout(draft),value=layout.text.slice(start,end);
+  const parts=index===null?[element]:cells.get(index)??[element];
+  inlineEdit={start,end,originalEnd:end,value,parts,index,kind:context?'context':index===null?'gap':'sentence',dirty:false,composing:false,eol:layout.text.includes('\r\n')?'\r\n':'\n'};
+  bodyEditor.dataset.kind=inlineEdit.kind;
+  bodyEditor.setAttribute('aria-label',index===null?'编辑空白行源码':'编辑当前句源码');
+  bodyEditor.value=textareaText(value);bodyEditor.hidden=false;
+  inlineEdit.region=mountSpanningEditor(parts,start,end,layout,context);
+  if(!inlineEdit.region){if(element&&element!==manuscript)element.before(bodyEditor);else manuscript.append(bodyEditor);}
+  for(const part of parts)if(part&&part!==manuscript)part.hidden=true;
+  const i=index??sentenceAt(layout,start);if(i!==null)select(i,false);
+
+  bodyEditor.focus({preventScroll:true});
+  const offset=textareaText(value.slice(0,Math.max(0,caret-start))).length;
+  bodyEditor.setSelectionRange(offset,offset);
+  updateDeleteControls();
+}
+function startAt(at,index=null,gap=null){
+  if(gap){startInline(gap.start,gap.end,gap.element,null,at);return;}
+  const layout=editorLayout(draft),i=index??sentenceAt(layout,at),part=layout.sentences[i];
+  if(part)startInline(part.start,part.end,cellAt(i)??manuscript,i,at);
+  else startInline(at,at,manuscript,null,at);
+}
+function resumeBodyInput(at){
+  if(!draft||mode!=='split'||switching)return;
+  const layout=editorLayout(draft);
+  at=Math.max(0,Math.min(at,layout.text.length));
+  const live=layout.sentences.filter(p=>!deleted(draft,p.i));
+  const part=live.find(p=>p.end>at)||live.findLast(p=>p.end===at)||live.at(-1)||layout.sentences[0];
+  if(!part)return;
+  const start=Math.min(at,part.start),end=Math.max(at,part.end);
+  startInline(start,end,cellAt(part.i)??manuscript,part.i,at,start!==part.start||end!==part.end);
+}
+function commitInline(){
+  const edit=inlineEdit;if(!edit||edit.composing||switching)return;
+  const before=textareaText(edit.value),after=bodyEditor.value,change=textEdit(before,after,edit.hint);
+  const hint=edit.hint;edit.hint=null;
+  if(!change)return;
+  const [a,b,value]=change,insert=edit.eol==='\r\n'?value.replaceAll('\n','\r\n'):value;
+  const start=edit.start+rawOffset(edit.value,a),end=edit.start+rawOffset(edit.value,b);
+  const next=edit.value.slice(0,start-edit.start)+insert+edit.value.slice(end-edit.start);
+  const layout=editorLayout(draft),{updates,gaps}=spliceEditorText(draft,layout,start,end,insert,edit.kind==='context'?undefined:edit.index??undefined);
+  const caret=[bodyEditor.selectionStart,bodyEditor.selectionEnd].map(p=>edit.start+rawOffset(next,p));
+  const previousCaret=(hint??[a,b]).map(p=>edit.start+rawOffset(edit.value,p));
+  if(applyBodyEdit(updates,gaps,previousCaret,caret)){
+    bodyUndo.at(-1).inline={start:edit.start,index:edit.index,values:[edit.value,next]};
+    edit.dirty=true;
+  }
+  edit.value=next;edit.end=edit.start+next.length;
+  if(selected!==null){revision.value=draft.notes[selected]?.revision??'';paintState();}
+
+}
+function finishInline(repaint=true){
+  const edit=inlineEdit;if(!edit)return;
+  if(edit.composing||paragraphPending)return;
+  commitInline();inlineEdit=null;
+  bodyEditor.hidden=true;reading.append(bodyEditor);
+  for(const part of edit.parts)if(part&&part!==manuscript)part.hidden=false;
+  if(edit.region)edit.region.box.replaceWith(...edit.region.nodes);
+  if(repaint&&edit.dirty)repaintAtScroll();
+}
+function editBodyRange(range,text){
+  if(!range||!draft||switching||mode==='source')return;
+  finishInline(false);
+  const layout=editorLayout(draft),[a,b]=range;
+  if(layout.text.includes('\r\n'))text=text.replace(/\r?\n/g,'\r\n');
+  const {updates,gaps}=spliceEditorText(draft,layout,a,b,text),caret=a+text.length;
+  if(applyBodyEdit(updates,gaps,[a,b],[caret,caret])){
+    selected=sentenceAt(editorLayout(draft),caret);
+    repaintAtScroll();paintEditor();resumeBodyInput(caret);
+  }
+}
+const graphemes=new Intl.Segmenter(undefined,{granularity:'grapheme'});
+function adjacentRange(text,at,backward){
+  const from=Math.max(0,at-64),to=Math.min(text.length,at+64);
+  const segments=[...graphemes.segment(text.slice(from,to))];
+  const part=backward?segments.findLast(s=>from+s.index<at):segments.find(s=>from+s.index+s.segment.length>at);
+  return part?(backward?[from+part.index,at]:[at,from+part.index+part.segment.length]):null;
+}
+function eraseAtCaret(backward){
+  if(!draft||mode!=='split'||switching||inlineEdit?.composing)return false;
+  const range=bodyRange();if(!range||range[0]!==range[1])return false;
+  if(inlineEdit&&!(backward?bodyEditor.selectionStart===0:bodyEditor.selectionEnd===bodyEditor.value.length))return false;
+  const target=adjacentRange(editorLayout(draft).text,range[0],backward);if(!target)return false;
+  editBodyRange(target,'');
+  return true;
+}
+async function beginParagraphBreak(){
+  const edit=inlineEdit;
+  if(!edit||edit.index===null||paragraphPending||switching)return;
+  const id=active.id;
+  const pending={edit,id,prefix:textareaText(edit.value)+'\n',requestId:crypto.randomUUID()};
+  pending.done=new Promise(resolve=>pending.resolve=resolve);
+  paragraphPending=pending;switching=true;
+  opinion.readOnly=revision.readOnly=true;updateDeleteControls();saveLabel('正在分段…');
+  try{
+    if(!await flush()||active?.id!==id)throw Error('请先保存当前稿件，再重试分段。');
+    saveLabel('正在分段…');
+    let record=await reviewApi(pathFor(id,'paragraph-break'),{
+      revision:active.revision,sentence:edit.index,requestId:pending.requestId
+    });
+    if(edit.composing)await new Promise(resolve=>pending.compositionDone=resolve);
+    const value=bodyEditor.value,caret=[bodyEditor.selectionStart,bodyEditor.selectionEnd];
+    const focus=document.activeElement,keepFocus=focus===bodyEditor;
+    if(!value.startsWith(pending.prefix)){
+      // If the author removes the break while it is saving, keep their latest input.
+      record=await reviewApi(pathFor(id,'paste-review'),{revision:record.meta.revision,token:record.token,action:'undo'});
+      draft=restoreDraft(record.draft);active=record.meta;
+      paragraphPending=null;switching=false;opinion.readOnly=revision.readOnly=false;
+      edit.hint=null;commitInline();updateDeleteControls();
+      if(!keepFocus)finishInline();
+      return;
+    }
+    const tail=value.slice(pending.prefix.length);
+    const selection=caret.map(p=>Math.max(0,p-pending.prefix.length));
+    inlineEdit=null;bodyEditor.hidden=true;reading.append(bodyEditor);
+    paragraphPending=null;switching=false;opinion.readOnly=revision.readOnly=false;
+    draft=restoreDraft(record.draft);active=record.meta;
+    pending.success=true;
+    selected=record.focus;pasteCaret=record.caret;
+    bodyUndo.push({token:record.token,paragraph:true});if(bodyUndo.length>100)bodyUndo.shift();bodyRedo=[];
+    repaintAtScroll(true);paintEditor();saveLabel('已保存');
+    startAt(record.caret,record.focus);
+    const another=tail.indexOf('\n\n');
+    if(another>=0&&selection[0]>=another+2){
+      // Drain additional paragraph breaks typed before the previous save completed.
+      bodyEditor.value=tail.slice(0,another+1);
+      bodyEditor.setSelectionRange(bodyEditor.value.length,bodyEditor.value.length);
+      inlineEdit.hint=[0,0];commitInline();
+      bodyEditor.value=tail;bodyEditor.setSelectionRange(...selection);
+      void beginParagraphBreak();
+    }else{
+      bodyEditor.value=tail;bodyEditor.setSelectionRange(...selection);
+      inlineEdit.hint=[0,0];commitInline();
+      if(!keepFocus){finishInline();focus?.focus({preventScroll:true});}
+    }
+    updateDeleteControls();
+  }catch(error){
+    paragraphPending=null;switching=false;opinion.readOnly=revision.readOnly=false;
+    if(inlineEdit===edit){edit.hint=null;commitInline();}
+    if(document.activeElement!==bodyEditor&&!pointerEdit)finishInline();
+    updateDeleteControls();
+    outputStatus('分段失败，当前输入仍保留：'+error.message,true);
+  }finally{
+    pending.resolve(Boolean(pending.success));
+  }
+}
+bodyEditor.addEventListener('beforeinput',event=>{
+  if(!inlineEdit)return;
+  if(['historyUndo','historyRedo'].includes(event.inputType)){event.preventDefault();undoBody(event.inputType==='historyRedo');return;}
+  if(!event.isComposing&&['deleteContentBackward','deleteContentForward'].includes(event.inputType)&&eraseAtCaret(event.inputType==='deleteContentBackward')){event.preventDefault();return;}
+  if(!inlineEdit.composing)inlineEdit.hint=[bodyEditor.selectionStart,bodyEditor.selectionEnd];
+  if(!event.isComposing&&['insertParagraph','insertLineBreak'].includes(event.inputType)){
     event.preventDefault();
-    const order = [...cells.keys()].sort((a,b)=>a-b);
-    const step = ['ArrowRight','ArrowDown'].includes(event.key) ? 1 : -1;
-    const next = event.key === 'Home' ? order[0] : event.key === 'End' ? order.at(-1) : order[order.indexOf(i)+step];
-    if (cellAt(next)) {
-      if(cellAt(cursor))cellAt(cursor).tabIndex = -1;
-      cursor = next;
-      cellAt(next).tabIndex = 0;
-      cellAt(next).focus();
+    const [start,end]=inlineEdit.hint;
+    const atTail=start===end&&end===bodyEditor.value.length;
+    const newParagraph=!paragraphPending&&atTail&&start>0&&bodyEditor.value[start-1]==='\n';
+    bodyEditor.setRangeText('\n',start,end,'end');
+    if(newParagraph)void beginParagraphBreak();else commitInline();
+  }
+});
+bodyEditor.addEventListener('input',commitInline);
+bodyEditor.addEventListener('compositionstart',()=>{if(inlineEdit){inlineEdit.composing=true;inlineEdit.hint=[bodyEditor.selectionStart,bodyEditor.selectionEnd];}});
+bodyEditor.addEventListener('compositionend',()=>{if(inlineEdit){inlineEdit.composing=false;commitInline();paragraphPending?.compositionDone?.();}});
+bodyEditor.addEventListener('keydown',event=>{
+  if(event.isComposing)return;
+  if(['Backspace','Delete'].includes(event.key)&&!event.ctrlKey&&!event.metaKey&&!event.altKey&&eraseAtCaret(event.key==='Backspace')){event.preventDefault();return;}
+  if(event.key==='Escape'){event.preventDefault();finishInline();manuscript.focus({preventScroll:true});}
+});
+bodyEditor.addEventListener('blur',()=>setTimeout(()=>{if(document.activeElement!==bodyEditor&&!pointerEdit)finishInline();void pollAi();},0));
+function offsetAtPoint(x,y){
+  const point=document.caretPositionFromPoint?.(x,y),range=point?null:document.caretRangeFromPoint?.(x,y);
+  const node=point?.offsetNode??range?.startContainer,offset=point?.offset??range?.startOffset;
+  return node?domOffset(node,offset):undefined;
+}
+function gapAt(element){
+  const gap=element?.closest?.('.md-gap,.text-gap');
+  if(!gap)return null;
+  return {start:currentOffset(cleanOffset(Number(gap.dataset.start))),end:currentOffset(cleanOffset(Number(gap.dataset.end))),element:gap};
+}
+function gapAtPosition(element,x,y){
+  const direct=gapAt(element);if(direct)return direct;
+  if(!manuscript.contains(element)||element.closest?.('.sentence'))return null;
+  for(const el of manuscript.querySelectorAll('.md-gap,.text-gap')){
+    const rect=el.getBoundingClientRect();
+    if(x>=rect.left&&x<=rect.right&&y>=rect.top&&y<=rect.bottom)return gapAt(el);
+  }
+  return null;
+}
+function gapPoint(gap,x,y){
+  if(!gap.element.classList.contains('md-gap')){
+    const node=gap.element.firstChild;
+    if(node?.nodeType===Node.TEXT_NODE){
+      let closest=gap.start,distance=Infinity;
+      for(const match of node.data.matchAll(/\r\n|\r|\n/g)){
+        const probe=document.createRange();probe.setStart(node,match.index);probe.setEnd(node,match.index+match[0].length);
+        const rect=probe.getBoundingClientRect(),d=Math.abs(y-(rect.top+rect.height/2));
+        if(d<distance){closest=gap.start+match.index;distance=d;}
+      }
+      if(distance<Infinity)return closest;
+    }
+    return offsetAtPoint(x,y)??gap.start;
+  }
+  const rect=gap.element.getBoundingClientRect(),line=parseFloat(getComputedStyle(gap.element).lineHeight);
+  const text=editorLayout(draft).text.slice(gap.start,gap.end),breaks=[...text.matchAll(/\r\n|\r|\n/g)];
+  const row=Math.max(0,Math.min(breaks.length-1,Math.floor((y-rect.top)/line)));
+  const match=breaks[row];
+  return match?gap.start+match.index+(gap.start===0?0:match[0].length):gap.start;
+}
+reading.addEventListener('pointerdown',event=>{
+  if(event.button!==0||!draft||mode!=='split'||switching)return;
+  suppressClick=false;
+  if((event.target===bodyEditor||bodyEditor.contains(event.target))){
+    pointerEdit={x:event.clientX,y:event.clientY,fromEditor:true,anchor:bodyRange()?.[0]};
+    const drag=pointerEdit;
+    setTimeout(()=>{
+      if(pointerEdit===drag&&!drag.custom&&inlineEdit)drag.anchor=bodyRange()?.[0];
+    },0);return;
+  }
+  if(!manuscript.contains(event.target))return;
+  const gap=gapAtPosition(event.target,event.clientX,event.clientY),at=gap?gapPoint(gap,event.clientX,event.clientY):offsetAtPoint(event.clientX,event.clientY),index=event.target.closest('.sentence')?.dataset.index;
+  pointerEdit={x:event.clientX,y:event.clientY,anchor:at,gap,index:index===undefined?null:Number(index)};
+  if(inlineEdit){
+    finishInline();event.preventDefault();pointerEdit.custom=true;
+    if(at!==undefined)restoreBodySelection([at,at]);
+  }else if(gap){
+    // Browsers do not place a caret reliably on a whitespace-only preview.
+    // Own this gesture (including a following drag) instead of letting mouseup
+    // discard the selection we just placed on the blank line.
+    event.preventDefault();pointerEdit.custom=true;restoreBodySelection([at,at]);
+  }
+},true);
+// A cross-editor gesture extends the selection; it must not start native text drag-and-drop.
+reading.addEventListener('dragstart',event=>{
+  if(pointerEdit?.custom)event.preventDefault();
+});
+function extendDrag(drag){
+  if(pointerEdit!==drag||!drag.custom||drag.anchor===undefined)return;
+  const edge=reading.getBoundingClientRect(),y=drag.yNow,x=drag.xNow;
+  const speed=y<edge.top+25?-20:y>edge.bottom-25?20:0;
+  if(speed)reading.scrollTop+=speed;
+  const at=offsetAtPoint(x,Math.max(edge.top+2,Math.min(edge.bottom-2,y)));
+  if(at!==undefined){drag.focus=at;restoreBodySelection([drag.anchor,at],false);}
+  if(speed)drag.frame=requestAnimationFrame(()=>extendDrag(drag));
+}
+document.addEventListener('pointermove',event=>{
+  const drag=pointerEdit;if(!drag||!(event.buttons&1))return;
+  if(Math.hypot(event.clientX-drag.x,event.clientY-drag.y)<5)return;
+  suppressClick=true;
+  if(drag.fromEditor&&!drag.custom){
+    const inside=[...bodyEditor.getClientRects()].some(rect=>event.clientX>=rect.left&&event.clientX<=rect.right&&event.clientY>=rect.top&&event.clientY<=rect.bottom);
+    if(inside)return;
+    const range=bodyRange();
+    if(range)drag.anchor=range[bodyEditor.selectionDirection==='backward'?1:0];
+    // Keep receiving pointer events when the active text run is replaced with its preview.
+    reading.setPointerCapture(event.pointerId);
+    finishInline();drag.custom=true;
+  }
+  if(!drag.custom||drag.anchor===undefined)return;
+  event.preventDefault();
+  drag.xNow=event.clientX;drag.yNow=event.clientY;
+  cancelAnimationFrame(drag.frame);extendDrag(drag);
+});
+document.addEventListener('pointerup',event=>{
+  const finished=pointerEdit;
+  const keep=finished?.custom&&suppressClick&&finished.anchor!==undefined&&finished.focus!==undefined
+    ?[finished.anchor,finished.focus]:null;
+  if(keep)event.preventDefault();
+  if(finished){
+    cancelAnimationFrame(finished.frame);
+    const activate=finished.custom&&!finished.fromEditor&&!suppressClick;
+    finished.custom=false;
+    if(activate){
+      suppressClick=true;
+      if(finished.gap)resumeBodyInput(finished.anchor);
+      else if(finished.index!==null)startAt(finished.anchor,finished.index);
     }
   }
+  setTimeout(()=>{
+    if(pointerEdit!==finished)return;
+    pointerEdit=null;
+    if(keep)restoreBodySelection(keep);
+  },0);
+});
+manuscript.addEventListener('click',event=>{
+  if(mode==='source'||switching||(event.target===bodyEditor||bodyEditor.contains(event.target))||suppressClick||selectionInside())return;
+  pasteCaret=null;
+  const at=pointerEdit?.anchor??offsetAtPoint(event.clientX,event.clientY);
+  const gap=gapAtPosition(event.target,event.clientX,event.clientY);
+  if(gap){resumeBodyInput(gapPoint(gap,event.clientX,event.clientY));return;}
+  const cell=event.target.closest('.sentence');
+  const index=cell?Number(cell.dataset.index):pointerEdit?.index;
+  if(index!==null&&index!==undefined){startAt(at??displaySentences[index].cleanStart,index);return;}
 });
 function updateNote(field, value) {
   if (!draft || selected === null || mode === 'source' || switching) return;
-  if (undoDeletion?.some(([i])=>i===selected)) {undoDeletion = null;updateDeleteControls();}
   const note = draft.notes[selected] ?? {opinion:'', revision:''};
   const before=note[field];
   if(before===value)return;
   note[field] = value;
+  if(field==='revision')delete note.literalWhitespace;
   delete note.autoOpinion;
   clearAiMark(selected,field,before,value);
   setNote(selected,note);
@@ -462,7 +887,6 @@ function updateNote(field, value) {
   scheduleSave();
   opinionUI.edited(selected,{human:field==='opinion'});
 }
-let undoDeletion = null;
 
 // AI 审稿 tags mark fields an AI wrote; a field the author edits is the author's from then on.
 function aiTitle(i){
@@ -509,11 +933,9 @@ function setNote(i,note) {
 }
 $('restore-sentence').onclick=()=>{
   if(!draft||selected===null||mode==='source'||switching)return;
-  if(inlineEdit)finishInline();
-  const next={...noteAt(selected),revision:''};delete next.deleted;
-  clearAiMark(selected,'revision');setNote(selected,next);
-  undoDeletion=null;updateDeleteControls();repaintAtScroll();paintEditor();scheduleSave();
-  outputStatus('已恢复原句，保留意见。');
+  const next={...noteAt(selected),revision:''};delete next.deleted;delete next.literalWhitespace;
+  applyBodyEdit(new Map([[selected,next]]));
+  repaintAtScroll();paintEditor();outputStatus('已恢复原句，保留意见。');
 };
 function selectionInside() {
   if (!draft || mode === 'source' || switching) return null;
@@ -522,105 +944,199 @@ function selectionInside() {
   const range = selection.getRangeAt(0);
   return manuscript.contains(range.startContainer) && manuscript.contains(range.endContainer) ? range : null;
 }
-function updateDeleteControls() {
-  $('delete-selection').disabled = !selectionInside();
-  $('undo-delete').hidden = !draft || mode === 'source' || !undoDeletion;
-  $('undo-delete').disabled = switching;
+function cleanOffset(at){
+  let lo=0,hi=ghostRanges.length;
+  while(lo<hi){const mid=(lo+hi)>>1;if(ghostRanges[mid].start<at)lo=mid+1;else hi=mid;}
+  const ghost=ghostRanges[lo-1];
+  return ghost?at-ghost.omitted-Math.min(at,ghost.end)+ghost.start:at;
 }
-function applyDeletion(updates, message, remember = true) {
-  undoDeletion = remember ? [...updates.keys()].map(i => [i,draft.notes[i] ? {...draft.notes[i]} : null]) : null;
-  for (const [i,note] of updates) {
-    if(note)delete note.autoOpinion;
-    clearAiMark(i,'revision');
-    setNote(i,note);
-    opinionUI.edited(i);
+function currentOffset(at){
+  return inlineEdit&&at>=inlineEdit.originalEnd?at+inlineEdit.end-inlineEdit.originalEnd:at;
+}
+function domOffset(node,offset,isEnd=false,details=false) {
+  if(!node||!manuscript.contains(node))return;
+  let mapped=displayOffsets.get(node);
+  if(!mapped){
+    const point=document.createRange();point.setStart(node,offset);point.collapse(true);
+    const walker=document.createTreeWalker(manuscript,NodeFilter.SHOW_TEXT);
+    let previous;
+    for(let t;(t=walker.nextNode());){
+      if(!displayOffsets.has(t))continue;
+      if(point.comparePoint(t,0)>=0){
+        node=isEnd&&previous?previous:t;offset=node===t?0:node.length;
+        break;
+      }
+      previous=t;
+    }
+    if(!displayOffsets.has(node)&&previous){node=previous;offset=node.length;}
+    mapped=displayOffsets.get(node);
   }
-  selected = updates.keys().next().value;
-  window.getSelection()?.removeAllRanges();
-  repaintAtScroll();
-  paintEditor();
-  scheduleSave();
-  outputStatus(message);
+  if(!mapped)return details?undefined:editorLayout(draft).text.length;
+  const at=offset===node.length?mapped.end:mapped.atomic?mapped.start:mapped.positions?.[offset]??mapped.start+offset;
+  const i=node.parentElement.closest('.sentence')?.dataset.index;
+  return details?{at,clean:mapped.clean, i:i===undefined?null:Number(i), node,offset}:currentOffset(mapped.clean?at:cleanOffset(at));
 }
-function deleteSelection(range) {
-  if (!range) return;
-  try {
-    const useRevision = true, groups = new Map(), selectedLengths = new Map();
-    for (const cell of manuscript.querySelectorAll('.sentence')) {
-      const i=Number(cell.dataset.index);
-      if(deleted(draft,i))continue;
-      const walker=document.createTreeWalker(cell,NodeFilter.SHOW_TEXT);
-      for(let node; (node=walker.nextNode());){
-        if(node.parentElement.closest('.diff-removed') || !range.intersectsNode(node))continue;
-        const a=range.startContainer===node?range.startOffset:0;
-        const b=range.endContainer===node?range.endOffset:node.length;
-        if(b<=a)continue;
-        const start=textOffsets.get(node);
-        if(start===undefined)throw new Error('选区含转换过的 Markdown 字符。请切到「查看源码」后再删。');
-        if(revised(draft,i).slice(start+a,start+b)!==node.data.slice(a,b))throw new Error('改稿已更新，请重新选中要删除的文字。');
-        if(!groups.has(i))groups.set(i,[]);
-        groups.get(i).push([start+a,start+b]);
-        selectedLengths.set(i,(selectedLengths.get(i)??0)+b-a);
-      }
-    }
-    if (!groups.size) return;
-    const updates = new Map();
-    for (const [i,ranges] of groups) {
-      if (deleted(draft,i)) continue;
-      const source = useRevision ? revised(draft,i) : original(draft,i);
-      const entireSource = ranges[0][0]===0 && ranges.at(-1)[1]===source.length &&
-        ranges.every(([a],n)=>n===0 || !source.slice(ranges[n-1][1],a).trim());
-      const entireMarkdownCell = isMarkdown() && !renderSource &&
-        selectedLengths.get(i) === cells.get(i).reduce((total,cell)=>total+[...cell.childNodes].reduce((n,child)=>n+(child.nodeType===Node.ELEMENT_NODE&&child.classList.contains('diff-removed')?0:child.textContent.length),0),0);
-      const full = entireSource || entireMarkdownCell;
-      if (full) {updates.set(i,{...noteAt(i),deleted:true});continue;}
-      if (isMarkdown() && !renderSource && ranges.some(([a],n)=>n>0 && source.slice(ranges[n-1][1],a).trim())) {
-        throw new Error('选区跨过 Markdown 标记，请切到「查看源码」后再删。');
-      }
-      updates.set(i,deleteTextRanges(draft,i,ranges,useRevision));
-    }
-    if (updates.size) applyDeletion(updates,'已从修改版删除，原文保留。');
-  } catch (error) { outputStatus(error.message,true); }
+function renderedSelection(range){
+  if(!range)return null;
+  if(range.startContainer===manuscript&&range.endContainer===manuscript&&range.startOffset===0&&range.endOffset===manuscript.childNodes.length)
+    return [0,editorLayout(draft).text.length];
+  const left=domOffset(range.startContainer,range.startOffset,false,true);
+  const right=domOffset(range.endContainer,range.endOffset,true,true);
+  if(!left||!right)return null;
+  let a=left.at,b=right.at;
+  const first=left.i===null?null:cells.get(left.i)?.[0];
+  const last=right.i===null?null:cells.get(right.i)?.at(-1);
+  const edge=(cell,end)=>{
+    const walker=document.createTreeWalker(cell,NodeFilter.SHOW_TEXT);
+    let result;
+    for(let t;(t=walker.nextNode());)if(!t.parentElement.closest('.diff-removed')){result=t;if(!end)break;}
+    return result;
+  };
+  const atFirst=first&&left.offset===0&&edge(first,false)===left.node;
+  const atLast=last&&right.offset===right.node.length&&edge(last,true)===right.node;
+  if(atFirst&&(left.i!==right.i||atLast))a=displaySentences[left.i].start;
+  if(atLast&&(left.i!==right.i||atFirst))b=displaySentences[right.i].end;
+  a=currentOffset(left.clean?a:cleanOffset(a));b=currentOffset(right.clean?b:cleanOffset(b));
+  return a<b?[a,b]:null;
 }
-$('delete-selection').addEventListener('mousedown',event=>event.preventDefault());
-$('delete-selection').onclick = () => deleteSelection(selectionInside());
+const bodyState=note=>[note?.revision??'',Boolean(note?.deleted),Boolean(note?.literalWhitespace)];
+const equalBody=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
+function applyBodyState(i,state){
+  const n={...noteAt(i),revision:state[0]};
+  if(state[1])n.deleted=true;else delete n.deleted;
+  if(state[2])n.literalWhitespace=true;else delete n.literalWhitespace;
+  delete n.autoOpinion;
+  clearAiMark(i,'revision');
+  setNote(i,n);
+  opinionUI.edited(i);
+}
+function setGaps(gaps){
+  if(gaps.length)draft.omittedGaps=gaps;else delete draft.omittedGaps;
+}
+function applyBodyEdit(updates,gaps=draft.omittedGaps??[],beforeCaret=null,afterCaret=null){
+  const rows=[];
+  for(const [i,note] of updates){
+    const before=bodyState(draft.notes[i]),after=bodyState(note);
+    if(!equalBody(before,after)){rows.push([i,before,after]);applyBodyState(i,after);}
+  }
+  const previous=draft.omittedGaps??[], changeGaps=!equalBody(previous,gaps);
+  if(!rows.length&&!changeGaps)return false;
+  if(changeGaps)setGaps(gaps);
+  bodyUndo.push({rows,gaps:changeGaps?[previous,gaps]:null,carets:[beforeCaret,afterCaret]});
+  if(bodyUndo.length>100)bodyUndo.shift();
+  bodyRedo=[];
+  scheduleSave();updateDeleteControls();
+  return true;
+}
+function undoBody(redo=false) {
+  if(!draft||mode==='source'||switching)return;
+  const from=redo?bodyRedo:bodyUndo, to=redo?bodyUndo:bodyRedo;
+  const step=from.pop();
+  if(!step)return;
+  if(step.token){
+    void changePastedReview({token:step.token,action:redo?'redo':'undo',paragraph:step.paragraph===true}).then(ok=>(ok?to:from).push(step)).finally(updateDeleteControls);
+    return;
+  }
+  const a=redo?1:2,b=redo?2:1;
+  const kept=step.rows.filter(row=>equalBody(bodyState(draft.notes[row[0]]),row[a]));
+  for(const row of kept)applyBodyState(row[0],row[b]);
+  const gaps=step.gaps&&equalBody(draft.omittedGaps??[],step.gaps[a-1])?step.gaps:null;
+  if(gaps)setGaps(gaps[b-1]);
+  if(kept.length||gaps){
+    to.push({...step,rows:kept,gaps});
+    const caret=step.carets[b-1],scroll=reading.scrollTop;
+    if(inlineEdit&&step.inline?.start===inlineEdit.start&&step.inline.index===inlineEdit.index){
+      const value=step.inline.values[b-1];
+      inlineEdit.value=value;inlineEdit.end=inlineEdit.start+value.length;inlineEdit.dirty=true;
+      bodyEditor.value=textareaText(value);
+      if(caret)bodyEditor.setSelectionRange(...caret.map(p=>textareaText(value.slice(0,Math.max(0,p-inlineEdit.start))).length));
+      paintEditor();
+    }else{
+      finishInline(false);
+      if(caret)selected=sentenceAt(editorLayout(draft),caret[0]);
+      repaintAtScroll();paintEditor();
+      if(caret)restoreBodySelection(caret);
+    }
+    reading.scrollTop=scroll;
+    scheduleSave();
+    outputStatus(redo?'已重做正文编辑。':'已撤销正文编辑。');
+  }else outputStatus('对应正文已被更新，未覆盖新的改动。',true);
+  updateDeleteControls();
+}
+function updateDeleteControls() {
+  $('delete-selection').disabled = switching || (inlineEdit?bodyEditor.selectionStart===bodyEditor.selectionEnd:!selectionInside());
+  $('undo-delete').hidden = !draft || mode === 'source' || !bodyUndo.length;
+  $('undo-delete').disabled = switching;
+  bodyEditor.readOnly=switching&&!paragraphPending;
+}
+function deleteSelection(){
+  if(!draft||mode==='source'||switching)return;
+  if(inlineEdit){inlineEdit.hint=[bodyEditor.selectionStart,bodyEditor.selectionEnd];bodyEditor.setRangeText('',...inlineEdit.hint,'end');commitInline();return;}
+  const layout=editorLayout(draft),range=renderedSelection(selectionInside());
+  if(!range||range[0]===range[1])return;
+  const [a,b]=range,{updates,gaps}=spliceEditorText(draft,layout,a,b,'');
+  if(!applyBodyEdit(updates,gaps,range,[a,a]))return;
+  selected=sentenceAt(editorLayout(draft),a);
+  const scroll=reading.scrollTop;
+  repaintAtScroll();paintEditor();resumeBodyInput(a);reading.scrollTop=scroll;
+  outputStatus('已从修改版删除，原文保留。');
+}
+for(const id of ['delete-selection','undo-delete'])$(id).addEventListener('mousedown',event=>event.preventDefault());
+$('delete-selection').onclick=deleteSelection;
+$('undo-delete').onclick=()=>undoBody();
 document.addEventListener('selectionchange',updateDeleteControls);
 document.addEventListener('keydown',event=>{
-  if (!['Delete','Backspace'].includes(event.key) || event.target.closest?.('textarea,input,dialog')) return;
-  const range = selectionInside();
-  if (range) {event.preventDefault();deleteSelection(range);}
+  if(event.target.closest?.('input,dialog')||event.target.closest?.('textarea')&&event.target!==bodyEditor)return;
+  if(!draft||mode==='source'||switching||event.isComposing)return;
+  const inside=manuscript.contains(event.target)||selectionInside()||event.target===document.body;
+  if((event.ctrlKey||event.metaKey)&&!event.altKey&&['z','y'].includes(event.key.toLowerCase())&&inside){
+    event.preventDefault();undoBody(event.shiftKey||event.key.toLowerCase()==='y');return;
+  }
+  if((event.target===bodyEditor||bodyEditor.contains(event.target)))return;
+  if(['Delete','Backspace'].includes(event.key)&&inside&&eraseAtCaret(event.key==='Backspace')){event.preventDefault();return;}
+  if(['ArrowLeft','ArrowRight'].includes(event.key)&&document.activeElement===manuscript){
+    const at=bodyRange();
+    if(at&&at[0]===at[1]){
+      const step=adjacentRange(editorLayout(draft).text,at[0],event.key==='ArrowLeft');
+      if(step){event.preventDefault();restoreBodySelection([event.key==='ArrowLeft'?step[0]:step[1]]);return;}
+    }
+  }
+  const range=selectionInside();
+  if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==='a'&&(range||manuscript.contains(event.target))){
+    event.preventDefault();
+    const all=document.createRange();all.selectNodeContents(manuscript);
+    window.getSelection().removeAllRanges();window.getSelection().addRange(all);
+  }else if(['Delete','Backspace'].includes(event.key)&&range){
+    event.preventDefault();deleteSelection();
+  }else if(range&&event.key.length===1&&!event.ctrlKey&&!event.metaKey&&!event.altKey){
+    const span=renderedSelection(range);
+    if(!span)return;
+    event.preventDefault();editBodyRange(span,event.key);
+  }
 });
-$('delete-sentence').onclick = () => {
-  if (!draft || selected===null || mode==='source' || switching) return;
-  const wasDeleted = deleted(draft,selected);
-  const next = {...noteAt(selected)};
-  if (wasDeleted) delete next.deleted;
-  else next.deleted = true;
-  applyDeletion(new Map([[selected,next]]),wasDeleted?'已恢复原句或此前的改版。':'已删除本句，原文保留。',!wasDeleted);
-};
-$('undo-delete').onclick = () => {
-  if (!undoDeletion || switching) return;
-  for (const [i,note] of undoDeletion) setNote(i,note);
-  undoDeletion = null;
-  repaintAtScroll();
-  paintEditor();
-  scheduleSave();
-  outputStatus('已撤销上次删除操作。');
+$('delete-sentence').onclick=()=>{
+  if(!draft||selected===null||mode==='source'||switching)return;
+  const wasDeleted=deleted(draft,selected), next={...noteAt(selected)};
+  if(wasDeleted)delete next.deleted;else next.deleted=true;
+  applyBodyEdit(new Map([[selected,next]]));
+  repaintAtScroll();paintEditor();
+  outputStatus(wasDeleted?'已恢复原句或此前的改版。':'已删除本句，原文保留。');
 };
 
 opinion.oninput = () => updateNote('opinion',opinion.value);
 revision.oninput = () => updateNote('revision',revision.value);
 
-function importedText(name,input,markdown) {
-  const edits=parseAnnotated(input), source=edits.source;
+function importedText(name,input,markdown,edits=parseAnnotated(input)) {
+  const source=edits.source;
   const format=markdown?'markdown':'plain';
   const value=createDraft(name,source,null,[],{format,spans:markdown?markdownSpans(source):undefined});
   if(edits.markers.length||edits.removed.length)value.notices.push('已识别审稿痕迹，保留原文并还原意见与改动。');
   return applyImportedEdits(value,edits);
 }
 function showWorkspace(record) {
+  window.getSelection()?.removeAllRanges();pointerEdit=null;suppressClick=false;
   draft = record?.draft ?? null;
-  undoDeletion = null;
+  bodyUndo=[];bodyRedo=[];pasteCaret=null;
   markdownMode = Boolean(draft && (draft.format === 'markdown' || (!draft.format && (/\.md$/i.test(draft.name) ||
     (draft.name === '粘贴的稿件' && looksLikeMarkdown(draft.source))))));
   active = record?.meta ?? null;
@@ -894,12 +1410,12 @@ async function importFile(file) {
         next = restoreDraft(value);
       } else {
         const edits=parseAnnotated(text);
-        next=importedText(file.name,text,ext==='md'||Boolean((edits.markers.length||edits.removed.length)&&looksLikeMarkdown(edits.source)));
+        next=importedText(file.name,text,ext==='md'||looksLikeMarkdown(edits.source),edits);
       }
     }
     await addDraft(next,ext === 'json' ? 'backup' : 'import');
   } catch (error) {
-    notice('导入失败：'+(error.message || '没有读到正文。'));
+    notice('导入失败：'+(error.message || '没有读到正文。'), true);
   } finally {
     busy = false;
     $('import').disabled = $('paste').disabled = $('drop-file').disabled = false;
@@ -949,11 +1465,12 @@ function outputStatus(message, failed = false) {
   clearTimeout(toastTimer);
   toast.textContent = message;
   toast.dataset.error = failed;
-  toast.hidden = false;
-  toastTimer = setTimeout(() => {toast.hidden = true;},failed ? 6500 : 3000);
+  toast.hidden = !message;
+  if (message) toastTimer = setTimeout(() => {toast.hidden = true;},failed ? 6500 : 3000);
 }
 async function outputDraft(kind, copy = false) {
   if (!draft) return;
+  if(paragraphPending){outputStatus('正在保存新段落，请稍后再导出。');return;}
   persist();
   const base = draft.name.replace(/\.(?:txt|md|docx)$/i,'').replace(/[<>:"/\\|?*\u0000-\u001f]/g,'_');
   $('export-menu').open = false;
@@ -967,7 +1484,7 @@ async function outputDraft(kind, copy = false) {
   }
   const clean = kind === 'clean';
   const changes = kind === 'changes';
-  const content = clean ? revisedText(draft) : changes ? annotatedChanges(draft) : annotatedText(draft);
+  const content = clean ? revisedText(draft) : changes ? annotatedChanges(draft) : annotatedText(draft,isMarkdown()&&draft.insertions?.length?markdownSpans(draft.source):undefined);
   if(changes&&!content){outputStatus('还没有改动或意见可以复制。');return;}
   if (copy) {
     try {
@@ -991,7 +1508,7 @@ const dropdowns = [$('export-menu'),$('history-menu'),$('change-options')];
 document.addEventListener('click', event => {
   if(event.target.closest?.('#history-delete-dialog'))return;
   // 「AI 来稿」 opens the history list from outside it; that same click must not close it again.
-  const opener = event.target.closest?.('#ai-inbox') ? $('history-menu') : null;
+  const opener = event.target.closest?.('#ai-inbox,#ai-arrival-open') ? $('history-menu') : null;
   for (const menu of dropdowns) if (menu.open && menu !== opener && !menu.contains(event.target)) menu.open = false;
 });
 document.addEventListener('keydown', event => {
@@ -1083,6 +1600,7 @@ function paintRemoteRecord(){
 function focusedFieldWouldChange(next){
   if(selected===null||mode==='source')return false;
   const target=document.activeElement;
+  if(manuscript.contains(target))return editorLayout(next).text!==editorLayout(draft).text;
   if(target!==opinion&&target!==revision)return false;
   const value=next.notes[selected]?.[target===opinion?'opinion':'revision']??'';
   // An AI part appended after what the author sees can be shown at once; any other change waits for blur.
@@ -1093,7 +1611,6 @@ for(const field of [opinion,revision])field.addEventListener('blur',()=>setTimeo
 function loadSameRecord(record){
   draft=restoreDraft(record.draft);
   active=record.meta;
-  undoDeletion=null;
   repaintAtScroll(true);
   paintEditor();
   saveLabel('已保存');
@@ -1123,11 +1640,10 @@ $('ai-seen-all').onclick=()=>dismissTags({});
 $('revision-swap').onclick=()=>{
   const saved=draft?.aiMarks?.[selected]?.replaced;
   if(!saved||mode==='source'||switching)return;
-  if(inlineEdit)finishInline();
   const next={...noteAt(selected),revision:saved.revision};
   if(saved.deleted)next.deleted=true;else delete next.deleted;
   clearAiMark(selected,'revision');setNote(selected,next);
-  undoDeletion=null;updateDeleteControls();repaintAtScroll();paintEditor();scheduleSave();
+  updateDeleteControls();repaintAtScroll();paintEditor();scheduleSave();
   opinionUI.edited(selected);
   outputStatus('已换回你自己的改写。');
 };
@@ -1169,7 +1685,6 @@ async function loadRecipients(){
 }
 $('notify-ai').onclick=()=>{
   if(!active?.id||switching||notifying)return;
-  finishInline();
   notifyDraft=active.id;
   notifyDialog.showModal();
   void loadRecipients();
@@ -1203,6 +1718,19 @@ function showAiInbox(records){
   button.textContent='AI 来稿 '+unread.length;
   return unread;
 }
+const announcedDrafts=new Set();let arrivalTimer;
+function announceIncoming(records){
+  const fresh=records.filter(x=>x.createdAt>=openedAt&&!announcedDrafts.has(x.id));
+  if(!fresh.length)return;
+  for(const item of fresh)announcedDrafts.add(item.id);
+  $('ai-arrival-title').textContent=fresh.length===1?'收到 AI 新稿':'收到 '+fresh.length+' 份 AI 新稿';
+  $('ai-arrival-names').replaceChildren(...fresh.map(item=>{const li=document.createElement('li');li.textContent=item.name;li.title=item.name;return li;}));
+  $('ai-arrival').style.top=document.querySelector('.toolbar').getBoundingClientRect().bottom+12+'px';
+  $('ai-arrival').hidden=false;clearTimeout(arrivalTimer);
+  arrivalTimer=setTimeout(()=>$('ai-arrival').hidden=true,10000);
+}
+$('ai-arrival-close').onclick=()=>{$('ai-arrival').hidden=true;clearTimeout(arrivalTimer);};
+$('ai-arrival-open').onclick=()=>{$('ai-arrival').hidden=true;setHistoryFilter('live');$('history-menu').open=true;void refreshHistory();};
 $('ai-inbox').onclick=()=>{setHistoryFilter('live');$('history-menu').open=true;};
 async function acknowledgeDraft(id){
   try {await reviewApi(pathFor(id,'seen'),{});}catch{}
@@ -1219,6 +1747,7 @@ async function pollAi(){
       if($('history-menu').open)refreshHistory();
     }
     const unread=showAiInbox(records);
+    announceIncoming(unread);
     const fresh=unread.find(x=>x.createdAt>=openedAt);
     if(fresh && !draft && !switching && !busy && !document.querySelector('dialog[open]') && !$('history-menu').open){
       await switchWorkspace(async()=>{
@@ -1242,7 +1771,10 @@ async function pollAi(){
               for(const cell of cells.get(Number(i))??[]){cell.dataset.aiEdited='true';cell.title='AI 刚写了这句，离开输入框后显示';}
             }
           }else{
-            draft=restoreDraft(record.draft);active=record.meta;undoDeletion=null;
+            if(record.draft.source!==draft.source){
+              bodyUndo=[];bodyRedo=[];selected=null;pasteCaret=null;markdownMode=record.draft.format==='markdown';
+            }
+          draft=restoreDraft(record.draft);active=record.meta;
             paintRemoteRecord();
           }
         }
@@ -1386,79 +1918,95 @@ async function copyMcpConnection(id,name){
   }
 }
 
-let inlineEdit = null, insidePointer = false;
-manuscript.addEventListener('pointerdown',()=>{insidePointer=true;},true);
-for(const event of ['pointerup','pointercancel']){
-  document.addEventListener(event,()=>{
-    insidePointer=false;
-    setTimeout(()=>{if(inlineEdit && document.activeElement!==inlineEdit.input)finishInline();},0);
-  });
-}
-function finishInline(repaint=true){
-  if(!inlineEdit)return;
-  const edit=inlineEdit;inlineEdit=null;
-  if(repaint)repaintAtScroll();
-  else {
-    edit.input.remove();
-    for(const cell of cells.get(edit.i)??[])cell.hidden=false;
+async function changePastedReview(request){
+  if(!draft||switching)return null;
+  const id=active.id;
+  switching=true;opinion.readOnly=revision.readOnly=true;updateDeleteControls();
+  try{
+    if(!await flush()||active?.id!==id)return null;
+    finishInline(false);
+    const record=await reviewApi(pathFor(id,'paste-review'),{...request,revision:active.revision});
+    draft=restoreDraft(record.draft);active=record.meta;
+    markdownMode=draft.format==='markdown';
+    if(!request.paragraph)renderSource=false;
+    selected=record.focus??sentenceAt(editorLayout(draft),record.caret);
+    pasteCaret=record.caret;
+    window.getSelection()?.removeAllRanges();
+    repaintAtScroll(true);paintEditor();
+    restoreBodySelection([record.caret,record.caret]);
+    saveLabel('已保存');
+    outputStatus(request.paragraph?(request.action==='undo'?'已撤销分段。':'已重做分段。'):
+      request.action==='undo'?'已撤销带注粘贴。':request.action==='redo'?'已重做带注粘贴。':'已插入当前稿件，还原意见与改动。');
+    void opinionUI.refresh();
+    return record;
+  }catch(error){
+    outputStatus(error.message||'粘贴失败，当前稿件未更改。',true);
+    return null;
+  }finally{
+    switching=false;opinion.readOnly=revision.readOnly=false;updateDeleteControls();
+    if(request.paragraph&&draft.insertedSlots?.includes(selected)&&!deleted(draft,selected))startAt(pasteCaret,selected);
   }
 }
-function startInline(i,cell,offset){
-  if(mode==='source'||switching||deleted(draft,i))return;
-  if(inlineEdit?.i===i)return;
-  if(inlineEdit){finishInline();cell=cellAt(i);}
-  if(!cellAt(i))return;
-  const input=document.createElement('textarea');
-  input.className='inline-edit';
-  input.rows=1;
-  input.spellcheck=false;
-  input.setAttribute('aria-label','编辑当前句块');
-  input.value=revised(draft,i);
-  const first=cellAt(i);
-  first.before(input);
-  for(const part of cells.get(i))part.hidden=true;
-  inlineEdit={i,input};
-  input.focus({preventScroll:true});
-  const at=Math.max(0,Math.min(offset??input.value.length,input.value.length));
-  input.setSelectionRange(at,at);
-  input.oninput=()=>{
-    if(inlineEdit?.input!==input||selected!==i||switching)return;
-    const n={...noteAt(i)};
-    delete n.autoOpinion;
-    clearAiMark(i,'revision');
-    if(input.value.trim()){n.revision=input.value;delete n.deleted;}
-    else n.deleted=true;
-    setNote(i,n);
-    if(undoDeletion?.some(([index])=>index===i))undoDeletion=null;
-    revision.value=input.value;
-    opinionUI.edited(i);
-    paintState();
-    $('revision-hint').textContent=n.deleted?'恢复本句后可编辑':isMarkdown()?'按 Markdown 填写，留空沿用原句':'留空则沿用原句';
-    updateDeleteControls();
-    scheduleSave();
-  };
-  input.onblur=()=>{if(inlineEdit?.input===input&&!insidePointer)finishInline();};
-  input.onkeydown=event=>{
-    if(event.key==='Escape'||(event.key==='Enter'&&(event.ctrlKey||event.metaKey))){
-      event.preventDefault();finishInline();
-      cellAt(i)?.focus({preventScroll:true});
+let pendingPasteWork=Promise.resolve();
+function pasteAfterParagraph(pending,text){
+  const value=bodyEditor.value,positions=[bodyEditor.selectionStart,bodyEditor.selectionEnd];
+  const range=positions.map(p=>pending.edit.start+rawOffset(
+    pending.edit.eol==='\r\n'?value.replaceAll('\n','\r\n'):value,p));
+  const expected=value.slice(...positions).replaceAll('\r\n','\n');
+  pendingPasteWork=pendingPasteWork.then(async()=>{
+    if(!await pending.done)throw Error('新段落未建立，请重新粘贴；当前输入仍保留。');
+    while(paragraphPending)if(!await paragraphPending.done)throw Error('分段未完成，请重新粘贴。');
+    if(active?.id!==pending.id||switching||mode!=='split')throw Error('编辑位置已切换，请在目标位置重新粘贴。');
+    const delta=pending.pasteDelta??0,[start,end]=range.map(p=>p+delta);
+    if(editorLayout(draft).text.slice(start,end).replaceAll('\r\n','\n')!==expected)
+      throw Error('选区内容已变化，请重新粘贴；没有覆盖后续输入。');
+    const record=await changePastedReview({text,start,end});
+    if(record){
+      pending.pasteDelta=delta+record.caret-end;
+      bodyUndo.push({token:record.token});if(bodyUndo.length>100)bodyUndo.shift();bodyRedo=[];updateDeleteControls();
     }
-  };
+  }).catch(error=>outputStatus(error.message,true));
 }
-function caretOffset(event,cell){
-  const ghost=event.target.closest('.diff-removed');
-  if(ghost)return Number(ghost.dataset.offset);
-  const caret=document.caretPositionFromPoint?.(event.clientX,event.clientY) ??
-    document.caretRangeFromPoint?.(event.clientX,event.clientY);
-  const target=caret?.offsetNode ?? caret?.startContainer;
-  const offset=caret?.offset ?? caret?.startOffset;
-  if(target?.nodeType!==Node.TEXT_NODE || !cell.contains(target) || typeof offset!=='number')return undefined;
-  const start=textOffsets.get(target);
-  if(start!==undefined)return start+offset;
-  const i=Number(cell.dataset.index),value=revised(draft,i),visible=target.data;
-  const at=value.indexOf(visible);
-  return at!==-1&&value.lastIndexOf(visible)===at?at+offset:undefined;
-}
+document.addEventListener('paste',event=>{
+  if(paragraphPending&&!event.defaultPrevented&&(event.target===bodyEditor||bodyEditor.contains(event.target))){
+    const text=event.clipboardData?.getData('text/plain');if(!text)return;
+    event.preventDefault();
+    const edits=parseAnnotated(text);
+    if(edits.markers.length||edits.removed.length||edits.boundaries?.length||edits.slots?.length)
+      pasteAfterParagraph(paragraphPending,text);
+    else bodyEditor.setRangeText(text,bodyEditor.selectionStart,bodyEditor.selectionEnd,'end');
+    return;
+  }
+  if(event.defaultPrevented||switching||busy||document.querySelector('dialog[open]'))return;
+  const target=event.target;
+  if(!manuscript.contains(target)&&target.closest?.('textarea,input,[contenteditable=true]'))return;
+  const atPreview=mode==='split'&&(manuscript.contains(target)||Boolean(selectionInside()));
+  const empty=!draft&&!target.closest?.('textarea,input,[contenteditable=true]');
+  if(!atPreview&&!empty)return;
+  const text=event.clipboardData?.getData('text/plain');
+  if(!text?.trim()&&!atPreview)return;
+  if(!text)return;
+  const edits=parseAnnotated(text), annotated=edits.markers.length||edits.removed.length||edits.boundaries?.length||edits.slots?.length;
+  if(empty){
+    event.preventDefault();
+    const md=looksLikeMarkdown(edits.source);
+    try{void addDraft(importedText(md?'粘贴的稿件.md':'粘贴的稿件',text,md,edits),'paste');}
+    catch(error){outputStatus(error.message,true);}
+    return;
+  }
+  if(annotated){
+    event.preventDefault();
+    const layout=editorLayout(draft);
+    const span=bodyRange()??[pasteCaret??layout.text.length,pasteCaret??layout.text.length];
+    void changePastedReview({text,start:span[0],end:span[1]}).then(record=>{
+      if(record){bodyUndo.push({token:record.token});if(bodyUndo.length>100)bodyUndo.shift();bodyRedo=[];updateDeleteControls();}
+    });
+    return;
+  }
+  event.preventDefault();
+  if(inlineEdit){inlineEdit.hint=[bodyEditor.selectionStart,bodyEditor.selectionEnd];bodyEditor.setRangeText(text,...inlineEdit.hint,'end');commitInline();}
+  else editBodyRange(bodyRange()??[pasteCaret??editorLayout(draft).text.length,pasteCaret??editorLayout(draft).text.length],text);
+},true);
 
 const migration = (async () => {
   try {

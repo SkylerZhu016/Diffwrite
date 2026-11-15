@@ -1,10 +1,12 @@
+import {editorLayout,insertReview,shiftReviewRanges} from './editor-text.mjs';
+import {reviewSnapshot,effectiveSnapshot,shiftSnapshot,importNotificationPatch,applyImportPatch,unionRanges,subtractRanges} from './notification-state.mjs';
 import {DatabaseSync} from 'node:sqlite';
 import {randomUUID,randomBytes,createHash,createCipheriv,createDecipheriv} from 'node:crypto';
 import {mkdirSync,readFileSync,writeFileSync} from 'node:fs';
 import {join} from 'node:path';
-import {homedir} from 'node:os';
+import {launchConfig} from './launch-config.mjs';
 import {restoreDraft,createDraft,original,revised,modified,deleted,reviewMark,hasReviewMark,effectiveOpinion,mergeDraftEdits,
-  withoutEditedAiMarks,setAiMarks,opinionParts,joinOpinion} from './model.mjs';
+  withoutEditedAiMarks,setAiMarks,opinionParts,joinOpinion,parseAnnotated,applyImportedEdits} from './model.mjs';
 import {defaultOpinionPrompt,normalizeOpinionSettings} from './opinion-ai.mjs';
 import {looksLikeMarkdown,markdownSpans} from './markdown.mjs';
 
@@ -20,8 +22,22 @@ const idPattern=/^[a-zA-Z0-9_-]{1,100}$/;
 const validId=id=>typeof id==='string' && idPattern.test(id);
 const digest=value=>createHash('sha256').update(value).digest();
 const originalConnection='original';
+const importBaseline='@import';
 const blankMark={opinion:'',revision:''};
-const sameBody=(a,b)=>a.revision===b.revision&&Boolean(a.deleted)===Boolean(b.deleted);
+const sameBody=(a,b)=>a.revision===b.revision&&Boolean(a.deleted)===Boolean(b.deleted)&&Boolean(a.literalWhitespace)===Boolean(b.literalWhitespace);
+function paragraphEol(source,anchor){
+  let before=null,after=null;
+  for(const match of source.matchAll(/\r\n|\r|\n/gu)){
+    const at=match.index;
+    if(at<anchor)before={at,value:match[0]};
+    else{after={at,value:match[0]};break;}
+  }
+  if(before&&after)return anchor-before.at<=after.at-anchor?before.value:after.value;
+  if(before)return before.value;
+  if(after)return after.value;
+  const crlf=(source.match(/\r\n/gu)??[]).length,lone=(source.match(/(?<!\r)\n|\r(?!\n)/gu)??[]).length;
+  return crlf>=lone&&crlf?'\r\n':'\n';
+}
 const ensureDraft=raw=>{
   try{return restoreDraft(raw);}catch{reject('稿件或分句数据无效。');}
 };
@@ -30,8 +46,7 @@ const textOf=(raw,max)=>{
   return raw;
 };
 
-export function openStore(location=process.env.DIFFWRITE_REVIEW_DATA ||
-  join(process.env.LOCALAPPDATA || homedir(),'Diffwrite')) {
+export function openStore(location=launchConfig().data) {
   mkdirSync(location,{recursive:true});
   const db=new DatabaseSync(join(location,'review.sqlite'));
   db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
@@ -138,8 +153,9 @@ export function openStore(location=process.env.DIFFWRITE_REVIEW_DATA ||
       q('DELETE FROM opinion_runs WHERE draft_id IN (SELECT value FROM json_each(?))').run(selection);
       q('DELETE FROM opinion_prompts WHERE NOT EXISTS (SELECT 1 FROM opinion_runs WHERE prompt_version=opinion_prompts.id)').run();
       q('DELETE FROM drafts WHERE id IN (SELECT value FROM json_each(?))').run(selection);
-      q("UPDATE operations SET result='{"+'"purged":true'+"}',input='' WHERE coalesce(json_extract(result,'$.draftId'),json_extract(result,'$.id')) IN (SELECT value FROM json_each(?))").run(selection);
+      q("UPDATE operations SET result='{"+'"purged":true'+"}',input='' WHERE coalesce(json_extract(result,'$.draftId'),json_extract(result,'$.id')) IN (SELECT value FROM json_each(?)) OR EXISTS (SELECT 1 FROM json_each(?) target WHERE substr(operations.key,1,length('paragraph-break:'||target.value||':'))='paragraph-break:'||target.value||':')").run(selection,selection);
     });
+    for(const [token,step] of pasteHistory)if(ids.includes(step.id))pasteHistory.delete(token);
     let compacted=false;
     try{
       db.exec('VACUUM');
@@ -155,7 +171,8 @@ export function openStore(location=process.env.DIFFWRITE_REVIEW_DATA ||
       if(!previous&&q('SELECT id FROM purged_drafts WHERE id=?').get(meta.id))reject('这份稿件已彻底删除。',410);
       if(previous?.meta.trashedAt)reject('这份稿件已移入「已删除」。请恢复后再编辑。',409);
       const stale=(previous?.meta.revision??0)!==meta.revision;
-      if(previous && (draft.source!==previous.draft.source || encode(draft.spans)!==encode(previous.draft.spans)))
+      if(previous && (draft.source!==previous.draft.source || encode(draft.spans)!==encode(previous.draft.spans) ||
+        encode(draft.insertions)!==encode(previous.draft.insertions) || encode(draft.insertedSlots)!==encode(previous.draft.insertedSlots)))
         reject('已有稿件的原文和句块不能覆盖。',409);
       const baseline=stale&&returnDraft&&previous?aiBaseline(previous,meta.revision):previous?.draft;
       if(stale&&(!returnDraft||!baseline))reject('稿件已被其他操作更新。',409);
@@ -175,7 +192,125 @@ export function openStore(location=process.env.DIFFWRITE_REVIEW_DATA ||
       const next=write(describe({...before,updatedAt:now,revision:(previous?.meta.revision??0)+1,
         humanReview:before.humanReview || humanMarks(humanDraft) ||
         Boolean(baseline && noteChanged(baseline.notes,humanDraft.notes))},draft),draft);
+      if(!previous)setKnown(importBaseline,meta.id,reviewSnapshot(draft));
       return returnDraft?{meta:next,draft}:next;
+    });
+  }
+  const pasteHistory=new Map();
+  function movePasteReferences(id,step,reverse){
+    const {at,count,anchor,length}=step, from=at+(reverse?count:0), delta=reverse?-count:count;
+    const currentDraft=need(id).draft;
+    if(reverse&&q('SELECT 1 FROM opinion_runs WHERE draft_id=? AND sentence>=? AND sentence<? LIMIT 1').get(id,at,from))
+      reject('这段文字已有新的 AI 审稿记录，不能整段撤销。',409);
+    q('UPDATE opinion_runs SET sentence=sentence+? WHERE draft_id=? AND sentence>=?').run(delta,id,from);
+    for(const {recipient,snapshot} of q('SELECT recipient,snapshot FROM review_baselines WHERE draft_id=?').all(id)){
+      setKnown(recipient,id,shiftSnapshot(effectiveSnapshot(decode(snapshot),currentDraft),step,reverse));
+    }
+  }
+  function paragraphBreak(id,request){
+    if(!request||typeof request!=='object'||Array.isArray(request))reject('分段请求无效。');
+    return atomic(()=>repeat('paragraph-break:'+id,request,()=>{
+      const {meta,draft}=need(id);
+      if(meta.revision!==request?.revision)reject('稿件已更新，请重新选中句末。',409);
+      const sentence=request?.sentence;
+      if(!Number.isSafeInteger(sentence)||sentence<0||sentence>=draft.spans.length)
+        reject('找不到要换段的句块。');
+      const current=revised(draft,sentence),trailing=/(\r\n|\n|\r)$/u.exec(current);
+      if(!trailing)reject('句末没有可拆分的换行，请重新编辑后再试。',409);
+      const before=structuredClone(draft),anchor=draft.spans[sentence][1];
+      const previous=note(draft,sentence),value=current.slice(0,-trailing[0].length);
+      const nextNotes=Object.fromEntries(Object.entries(draft.notes).map(([key,value])=>
+        [Number(key)<=sentence?Number(key):Number(key)+1,value]));
+      const nextNote={opinion:'',revision:'',...previous};
+      if(value===original(draft,sentence)){nextNote.revision='';delete nextNote.literalWhitespace;}
+      else{
+        nextNote.revision=value;
+        if(value&&!value.trim())nextNote.literalWhitespace=true;else delete nextNote.literalWhitespace;
+      }
+      if(nextNote.opinion||nextNote.revision||nextNote.deleted||nextNote.autoOpinion)nextNotes[sentence]=nextNote;
+      else delete nextNotes[sentence];
+      const marks=Object.fromEntries(Object.entries(draft.aiMarks??{}).map(([key,value])=>
+        [Number(key)<=sentence?Number(key):Number(key)+1,value]));
+      const parentMark={...marks[sentence]};
+      delete parentMark.body;delete parentMark.replaced;
+      if(Object.keys(parentMark).length)marks[sentence]=parentMark;else delete marks[sentence];
+      const source=draft.source,eol=paragraphEol(source,anchor),separator=eol+eol;
+      if(source.length+separator.length>1_500_000)reject('稿件太长，无法新建段落。');
+      const next={...draft,source:source.slice(0,anchor)+separator+source.slice(anchor),notes:nextNotes,
+        spans:[...draft.spans.slice(0,sentence+1),[anchor+separator.length,anchor+separator.length],
+          ...draft.spans.slice(sentence+1).map(([a,b])=>[a+separator.length,b+separator.length])],
+        insertedSlots:[...(draft.insertedSlots??[]).map(i=>i>sentence?i+1:i),sentence+1].sort((a,b)=>a-b),
+        omittedGaps:shiftReviewRanges(draft.omittedGaps??[],anchor,separator.length),
+        insertions:[...shiftReviewRanges(draft.insertions??[],anchor,separator.length),[anchor,anchor+separator.length]]
+          .sort((a,b)=>a[0]-b[0])};
+      if(Object.keys(marks).length)next.aiMarks=marks;else delete next.aiMarks;
+      const committed=ensureDraft(next),at=sentence+1,count=1,length=separator.length;
+      const beforeLayout=editorLayout(before),afterLayout=editorLayout(committed);
+      const start=beforeLayout.sentences[sentence].end,caret=afterLayout.sentences[at].start;
+      const token=randomUUID(),step={id,at,count,anchor,length,before,after:committed,start,end:caret,focus:at};
+      movePasteReferences(id,step,false);
+      const remapped={notes:Object.fromEntries(Object.entries(before.notes).map(([key,n])=>
+        [Number(key)<at?Number(key):Number(key)+count,n]))};
+      reconcileOpinionRuns(id,remapped,committed);
+      const nextMeta=write(describe({...meta,updatedAt:Date.now(),revision:meta.revision+1,humanReview:true},committed),committed);
+      pasteHistory.set(token,step);
+      if(pasteHistory.size>12)pasteHistory.delete(pasteHistory.keys().next().value);
+      return {meta:nextMeta,draft:committed,token,caret,focus:at};
+    }));
+  }
+  function pasteReview(id,request){
+    return atomic(()=>{
+      const {meta,draft}=need(id);
+      if(meta.revision!==request?.revision)reject('稿件已更新，请重新选中粘贴位置。',409);
+      let step, next, token=request.token, caret, focus;
+      if(token!==undefined){
+        step=pasteHistory.get(token);
+        if(!step||step.id!==id)reject('这次粘贴已不能撤销或重做。',409);
+        const reverse=request.action==='undo';
+        if((!reverse&&request.action!=='redo')||encode(draft)!==encode(reverse?step.after:step.before))
+          reject('正文或批注已更新，未覆盖后续改动。',409);
+        next=structuredClone(reverse?step.before:step.after);
+        caret=reverse?step.start:step.end;
+        focus=reverse?null:step.focus;
+        if(reverse&&step.importPatches)patchImportedBaselines(id,step.importPatches,true);
+        movePasteReferences(id,step,reverse);
+        if(!reverse&&step.importPatches)patchImportedBaselines(id,step.importPatches);
+        reconcileOpinionRuns(id,next,next);
+        if(reverse)step.before=next;else step.after=next;
+      }else{
+        const edits=parseAnnotated(textOf(request.text,1_500_000));
+        if(!edits.source.trim()||(!edits.markers.length&&!edits.removed.length&&!edits.boundaries?.length))reject('没有可插入的带注正文。');
+        const markdown=looksLikeMarkdown(edits.source);
+        const fragment=applyImportedEdits(createDraft('',edits.source,null,[],
+          {format:markdown?'markdown':'plain',spans:markdown?markdownSpans(edits.source):undefined}),edits);
+        if(draft.source.length+fragment.source.length>1_500_000)reject('粘贴后的稿件太长。');
+        try{step=insertReview(draft,fragment,request.start,request.end);}
+        catch(e){reject(e.message);}
+        if(step.draft.source.length>1_500_000)reject('粘贴后的稿件太长。');
+        next=ensureDraft(step.draft);
+        // A fallback also covers connections created after this import. Never
+        // initialize it from an existing draft's current, possibly unsent edits.
+        if(!q('SELECT 1 FROM review_baselines WHERE recipient=? AND draft_id=?').get(importBaseline,id))
+          setKnown(importBaseline,id,{effective:true,notes:{},gaps:[]});
+        const importPatches=Object.fromEntries(q('SELECT recipient,snapshot FROM review_baselines WHERE draft_id=?').all(id)
+          .map(({recipient,snapshot})=>[recipient,importNotificationPatch(draft,next,step,decode(snapshot))]));
+        movePasteReferences(id,step,false);
+        patchImportedBaselines(id,importPatches);
+        // Pending/automatic completions keep their original sentence identity after shifting.
+        const remapped={notes:Object.fromEntries(Object.entries(draft.notes).map(([key,value])=>
+          [Number(key)<step.at?Number(key):Number(key)+step.count,value]))};
+        reconcileOpinionRuns(id,remapped,next);
+        // Keep only the structurally committed versions in this session's undo history.
+        token=randomUUID();caret=request.start+step.insertedText;focus=step.at;
+        step={id,at:step.at,count:step.count,anchor:step.anchor,length:step.length,
+          before:draft,after:next,start:request.start,end:caret,focus,importPatches};
+      }
+      const nextMeta=write(describe({...meta,updatedAt:Date.now(),revision:meta.revision+1,humanReview:true},next),next);
+      if(!request.token){
+        pasteHistory.set(token,step);
+        if(pasteHistory.size>12)pasteHistory.delete(pasteHistory.keys().next().value);
+      }
+      return {meta:nextMeta,draft:next,token,caret,focus};
     });
   }
   function migrate(meta,raw){
@@ -189,6 +324,7 @@ export function openStore(location=process.env.DIFFWRITE_REVIEW_DATA ||
       write(describe({id:meta.id,kind:['paste','import','backup','legacy'].includes(meta.kind)?meta.kind:'legacy',
         createdAt:at(meta.createdAt),updatedAt:at(meta.updatedAt),revision:1,
         humanReview:humanMarks(draft),aiReview:false,unread:false},draft),draft);
+      setKnown(importBaseline,meta.id,reviewSnapshot(draft));
     });
   }
   function seen(id){
@@ -223,11 +359,18 @@ export function openStore(location=process.env.DIFFWRITE_REVIEW_DATA ||
   const humanBody=(draft,i)=>modified(draft,i)&&!draft.aiMarks?.[i]?.body;
   function knownTo(recipient,id){
     const row=q('SELECT snapshot FROM review_baselines WHERE recipient=? AND draft_id=?').get(recipient,id);
-    return row?decode(row.snapshot):{notes:{},gaps:[]};
+    const inherited=row??q('SELECT snapshot FROM review_baselines WHERE recipient=? AND draft_id=?').get(importBaseline,id);
+    return inherited?decode(inherited.snapshot):{notes:{},gaps:[]};
   }
   function setKnown(recipient,id,snapshot){
     q('INSERT INTO review_baselines VALUES(?,?,?) ON CONFLICT(recipient,draft_id) DO UPDATE SET snapshot=excluded.snapshot')
       .run(recipient,id,encode(snapshot));
+  }
+  function patchImportedBaselines(id,patches,reverse=false){
+    for(const {recipient,snapshot} of q('SELECT recipient,snapshot FROM review_baselines WHERE draft_id=?').all(id)){
+      const patch=patches[recipient]??patches[importBaseline];
+      if(patch)setKnown(recipient,id,applyImportPatch(decode(snapshot),patch,reverse));
+    }
   }
   // AI writes land in the same opinion and revision fields the author uses, tagged AI 审稿.
   // The author's opinion text is never altered, and a revision the author wrote is only replaced on request.
@@ -245,9 +388,9 @@ export function openStore(location=process.env.DIFFWRITE_REVIEW_DATA ||
         if(edit.original!==source)reject('句块原文与当前稿件不匹配。',409);
         if(edit.opinion===undefined&&edit.replacement===undefined&&edit.deleted===undefined)reject('请选择要修改的内容。');
         if(edit.deleted===true&&edit.replacement!==undefined)reject('删除与改写不能同时提交。');
-        const old=draft.notes[i], next={...note(draft,i)}, mark={...marks[i]}, body={revision:next.revision};
+        const old=draft.notes[i], next={...note(draft,i)}, mark={...marks[i]}, body={revision:next.revision,...(next.literalWhitespace?{literalWhitespace:true}:{})};
         if(next.deleted)body.deleted=true;
-        if(edit.replacement!==undefined){body.revision=edit.replacement===source?'':edit.replacement;delete body.deleted;}
+        if(edit.replacement!==undefined){body.revision=edit.replacement===source?'':edit.replacement;delete body.deleted;delete body.literalWhitespace;}
         if(edit.deleted===true)body.deleted=true;
         if(edit.deleted===false)delete body.deleted;
         let aside='';
@@ -261,8 +404,9 @@ export function openStore(location=process.env.DIFFWRITE_REVIEW_DATA ||
             if(humanBody(draft,i))mark.replaced={revision:next.revision,...(next.deleted?{deleted:true}:{})};
             next.revision=body.revision;
             if(body.deleted)next.deleted=true;else delete next.deleted;
+            if(body.literalWhitespace)next.literalWhitespace=true;else delete next.literalWhitespace;
             // Undoing its own change on an untouched sentence leaves nothing to tag.
-            if(next.deleted||(next.revision.trim()&&next.revision!==source)||mark.replaced)mark.body=true;
+            if(next.deleted||((next.revision.trim()||next.literalWhitespace)&&next.revision!==source)||mark.replaced)mark.body=true;
             else delete mark.body;
           }
         }
@@ -343,8 +487,8 @@ export function openStore(location=process.env.DIFFWRITE_REVIEW_DATA ||
       for(const i of candidates){
         const before=old[i]??blankMark, after=marks[i]??blankMark;
         // Legacy snapshots stored raw input, including drafts that never changed the effective sentence.
-        const normalized={opinion:before.opinion?.trim()?before.opinion:'',
-          revision:!before.deleted&&before.revision?.trim()&&before.revision!==original(draft,i)?before.revision:'',
+        const normalized=snapshot.effective?before:{opinion:before.opinion?.trim()?before.opinion:'',
+          revision:!before.deleted&&(before.revision?.trim()||before.literalWhitespace)&&before.revision!==original(draft,i)?before.revision:'',
           ...(before.deleted?{deleted:true}:{})};
         if(!noteChanged(normalized,after))continue;
         const restored=Boolean((normalized.deleted||normalized.revision)&&!after.deleted&&!after.revision);
@@ -356,19 +500,20 @@ export function openStore(location=process.env.DIFFWRITE_REVIEW_DATA ||
       const gaps=draft.omittedGaps??[], oldGaps=snapshot.gaps??[];
       const gapChanges=[];
       for(const [before,after,action] of [[oldGaps,gaps,'deleted'],[gaps,oldGaps,'restored']]){
-        const covered=new Set(before.map(([a,b])=>a+':'+b));
-        for(const [start,end] of after)if(!covered.has(start+':'+end))
+        for(const [start,end] of subtractRanges(after,before))
           gapChanges.push({start,end,action});
       }
       // Apply restorations first if a single deleted whitespace range was shortened.
       gapChanges.sort((a,b)=>Number(b.action==='restored')-Number(a.action==='restored')||a.start-b.start);
+      const structureChanged=encode(unionRanges(snapshot.insertions??[]))!==encode(unionRanges(draft.insertions??[]))||
+        encode(snapshot.insertedSlots??[])!==encode(draft.insertedSlots??[]);
       const payload={draftId:id,title:meta.name,revision:meta.revision,recipient:connection.name,
-        changeCount:changes.length+gapChanges.length};
+        ...(structureChanged?{structureChanged:true}:{}),changeCount:changes.length+gapChanges.length+Number(structureChanged)};
       if(!payload.changeCount)return {...payload,queued:false};
       Object.assign(payload,{id:randomUUID(),createdAt:Date.now()});
       q('INSERT INTO notices(id,draft_id,created_at,payload,notes,recipient) VALUES(?,?,?,?,?,?)')
         .run(payload.id,id,payload.createdAt,encode({...payload,changes,...(gapChanges.length?{gapChanges}:{})}),'{}',recipient);
-      setKnown(recipient,id,{notes:marks,gaps});
+      setKnown(recipient,id,reviewSnapshot(draft));
       return {...payload,queued:true};
     });
   }
@@ -497,10 +642,20 @@ export function openStore(location=process.env.DIFFWRITE_REVIEW_DATA ||
   }
   function opinionInput(draft,i){
     const prefix=note(draft,i).opinion;
-    const around=j=>j<0||j>=draft.spans.length?'':original(draft,j);
+    const around=j=>{
+      if(j<0||j>=draft.spans.length)return '';
+      const text=original(draft,j);
+      if(text)return text;
+      return draft.insertedSlots?.includes(j)&&modified(draft,j)?revised(draft,j):'';
+    };
+    const before=[];
+    for(let j=i-1;j>=0&&before.length<2;j--){const text=around(j);if(text)before.push(text);}
+    before.reverse();
+    const after=[];
+    for(let j=i+1;j<draft.spans.length&&after.length<2;j++){const text=around(j);if(text)after.push(text);}
     return {original:around(i).slice(0,2200),revision:deleted(draft,i)?null:modified(draft,i)?revised(draft,i).slice(0,1600):'',
-      before:[around(i-2).slice(-140),around(i-1).slice(-280)].filter(Boolean),
-      after:[around(i+1).slice(0,280),around(i+2).slice(0,140)].filter(Boolean),prefix};
+      before:before.map((text,index)=>text.slice(-(before.length===1||index===1?280:140))),
+      after:after.map((text,index)=>text.slice(0,index===0?280:140)),prefix};
   }
   const validSentence=(draft,i)=>Number.isSafeInteger(i)&&i>=0&&i<draft.spans.length;
   function prepareOpinion(id,request){
@@ -519,12 +674,12 @@ export function openStore(location=process.env.DIFFWRITE_REVIEW_DATA ||
     if(config.key){
       try{apiKey=unseal(config.key);}catch{reject('无法读取已保存的模型密钥，请重新填写。',409);}
     }
-    return {input,config:{...config,apiKey}};
+    return {input,source:draft.source,config:{...config,apiKey}};
   }
   function finishOpinion(id,i,prepared,suffix){
     return atomic(()=>{
       const rec=read(id,true);
-      if(!rec)return {run:null};
+      if(!rec||rec.draft.source!==prepared.source)return {run:null};
       const same=!rec.meta.trashedAt&&encode(prepared.input)===encode(opinionInput(rec.draft,i));
       const state=same?(suffix?'pending':'empty'):'superseded';
       const runId=randomUUID(), createdAt=Date.now(), {input,config}=prepared;
@@ -772,6 +927,6 @@ export function openStore(location=process.env.DIFFWRITE_REVIEW_DATA ||
     });
   }
   upgrade();
-  return {list,read,setTrash,purge,purgedIds,saveBrowser,migrate,seen,publish,notify,listNotices,dismissAiTags,mcpMode,setMcpMode,
+  return {list,read,setTrash,purge,purgedIds,saveBrowser,pasteReview,paragraphBreak,migrate,seen,publish,notify,listNotices,dismissAiTags,mcpMode,setMcpMode,
     readNotice,ack,readSentences,createConnection,connections,rotate,revoke,authorized,copyToken,editDraft,automationOpinion,setAutomationOpinion,promptVersions,previewOpinion,automationFeedback,opinionSettings,saveOpinionSettings,prepareOpinion,finishOpinion,currentOpinions,decideOpinion,opinionFeedback,close:()=>db.close()};
 }

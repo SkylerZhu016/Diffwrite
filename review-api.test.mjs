@@ -76,3 +76,30 @@ test('handwritten Streamable HTTP clients write opinions and rewrites straight i
   const negotiated=await rpc('initialize',{protocolVersion:'unknown-future-version',capabilities:{},clientInfo:{name:'omp',version:'1'}});
   assert.notEqual(negotiated.protocolVersion,'unknown-future-version');
 });
+
+test('the local API creates paragraph slots only after a current-revision double-Enter request',async t=>{
+  const dir=mkdtempSync(join(tmpdir(),'diffwrite-paragraph-api-')),store=openStore(dir);
+  const published=store.publish({requestId:'api-paragraph',title:'段落接口',text:'句子。后句。',format:'plain'});
+  const record=store.read(published.id);
+  record.draft.notes[0]={opinion:'留在旧句上的意见',revision:'句子。\n'};
+  const saved=store.saveBrowser(record.meta,record.draft,true);
+  let api;
+  const server=createServer((req,res)=>api(req,res));
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  const origin='http://127.0.0.1:'+server.address().port;
+  api=makeReviewApi(origin,store);
+  t.after(async()=>{await new Promise(resolve=>server.close(resolve));store.close();rmSync(dir,{recursive:true,force:true});});
+  const response=await fetch(origin+'/api/drafts/'+published.id+'/paragraph-break',{method:'POST',headers:{
+    'X-Diffwrite':'1','Sec-Fetch-Site':'same-origin','Content-Type':'application/json'},
+    body:JSON.stringify({revision:saved.meta.revision,sentence:0,requestId:'api-double-enter'})});
+  assert.equal(response.status,200);
+  const result=await response.json();
+  assert.equal(typeof result.token,'string');
+  assert.equal(result.focus,1);
+  assert.deepEqual(result.draft.insertedSlots,[1]);
+  assert.equal(result.draft.notes[0].opinion,'留在旧句上的意见');
+  const stale=await fetch(origin+'/api/drafts/'+published.id+'/paragraph-break',{method:'POST',headers:{
+    'X-Diffwrite':'1','Sec-Fetch-Site':'same-origin','Content-Type':'application/json'},
+    body:JSON.stringify({revision:saved.meta.revision,sentence:0,requestId:'api-stale'})});
+  assert.equal(stale.status,409);
+});

@@ -1,6 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {splitSentences,createDraft,restoreDraft,original,modified,revisedText,annotatedText,annotatedChanges,pieces,deleteTextRanges,parseAnnotated,applyImportedEdits,mergeDraftEdits} from './model.mjs';
+import {markdownSpans} from './markdown.mjs';
 
 const cut = (source, breaks) => splitSentences(source,breaks).map(([a,b])=>source.slice(a,b));
 
@@ -36,6 +37,31 @@ test('restoring an existing draft retains its stored sentence numbering and manu
   assert.equal(original(restored,1),'md。');
   assert.equal(restored.notes[1].opinion,'旧句块意见');
   assert.equal(createDraft('新稿',source).spans.length,2);
+});
+test('only explicitly indexed zero-length slots are valid and annotated text restores their notes',()=>{
+  const source='## 甲句。\n\n乙句。',base=createDraft('Markdown 空句槽',source,null,[],{format:'markdown',spans:markdownSpans(source)});
+  const raw={...base,spans:[base.spans[0],[base.spans[1][0],base.spans[1][0]],base.spans[1]],insertedSlots:[1],
+    notes:{1:{opinion:'新段落另起一条意见',revision:'补写的新段。'}}};
+  const draft=restoreDraft(raw);
+  assert.equal(original(draft,1),'');
+  assert.equal(revisedText(draft),'## 甲句。\n\n补写的新段。乙句。');
+  assert.throws(()=>restoreDraft({...raw,insertedSlots:undefined}),/备份/);
+  assert.throws(()=>restoreDraft({...raw,insertedSlots:null}),/备份/);
+  assert.throws(()=>restoreDraft({...raw,insertedSlots:[0]}),/备份/);
+  const exported=annotatedText(draft),edits=parseAnnotated(exported);
+  assert.equal(edits.source,source);
+  const imported=applyImportedEdits(createDraft('回导',edits.source,null,[],
+    {format:'markdown',spans:markdownSpans(edits.source)}),edits);
+  assert.deepEqual(imported.insertedSlots,[1]);
+  assert.deepEqual(imported.notes[1],draft.notes[1]);
+  assert.equal(revisedText(imported),revisedText(draft));
+});
+test('omitted whitespace may contain an empty slot anchor but never a real sentence span',()=>{
+  const source='甲句。\n\n\n\n乙句。',base={version:1,name:'跨段删除',source,
+    spans:[[0,3],[5,5],[7,10]],insertedSlots:[1],notes:{},notices:[]};
+  const restored=restoreDraft({...base,omittedGaps:[[3,7]]});
+  assert.deepEqual(restored.omittedGaps,[[3,7]]);
+  assert.throws(()=>restoreDraft({...base,omittedGaps:[[3,10]]}),/备份/);
 });
 test('updates duplicate sentences separately, only nonempty differing revisions count', () => {
   const d=createDraft('重复','　同一句。\r\n\r\n\t同一句。  ');

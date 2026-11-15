@@ -30,7 +30,7 @@ var buildID string
 
 var allowed = map[string]bool{
 	"node.exe": true, "index.html": true, "style.css": true, "server.mjs": true,
-	"app.mjs": true, "model.mjs": true, "docx.mjs": true, "markdown.mjs": true,
+	"app.mjs": true, "inline-text.mjs": true, "editor-text.mjs": true, "notification-state.mjs": true, "launch-config.mjs": true, "model.mjs": true, "docx.mjs": true, "markdown.mjs": true,
 	"changes.mjs": true, "history.mjs": true, "opinion-ai.mjs": true, "opinion-ui.mjs": true, "opinion-prompt.txt": true, "review-api.mjs": true,
 	"review-store.mjs": true, "review-mcp.mjs": true, "vendor/markdown-parser.mjs": true,
 	"vendor/mcp-sdk.mjs": true, "THIRD_PARTY_NOTICES.txt": true,
@@ -188,7 +188,7 @@ func ownWorker(pid int) (syscall.Handle, error) {
 	return handle, nil
 }
 
-const healthSignature = "diffwrite-v9"
+const healthSignature = "diffwrite-v19"
 
 func run() error {
 	if len(os.Args) > 2 || (len(os.Args) == 2 && os.Args[1] != "--no-browser" && os.Args[1] != "--licenses") {
@@ -206,6 +206,7 @@ func run() error {
 		return writeLicenses(text)
 	}
 	interactive := len(os.Args) == 1
+	if err := applyLaunchConfig(); err != nil { return err }
 	port := 41732
 	if raw := os.Getenv("DIFFWRITE_REVIEW_PORT"); raw != "" {
 		var err error

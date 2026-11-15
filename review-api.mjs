@@ -44,7 +44,7 @@ export function makeReviewApi(origin,store=openStore()) {
       }
       if(!browserAllowed(req)){send(res,403,{error:'只允许本机审稿页面访问。'});return true;}
       const get=req.method==='GET', post=req.method==='POST';
-      const match=/^\/api\/drafts\/([a-zA-Z0-9_-]{1,100})(?:\/(ai-tags|notify|seen|trash|restore|opinion-runs|opinion-generate|opinion-decision))?$/.exec(path);
+      const match=/^\/api\/drafts\/([a-zA-Z0-9_-]{1,100})(?:\/(paste-review|paragraph-break|ai-tags|notify|seen|trash|restore|opinion-runs|opinion-generate|opinion-decision))?$/.exec(path);
       const connection=/^\/api\/mcp-connections\/([a-zA-Z0-9_-]{1,100})\/(copy|rotate|revoke)$/.exec(path);
       let result;
       if(get&&path==='/api/drafts') result=store.list();
@@ -70,6 +70,8 @@ export function makeReviewApi(origin,store=openStore()) {
       else if(match){
         const [,id,action]=match;
         if(get&&!action){result=store.read(id);if(!result)throw new RequestError('找不到稿件。',404);}
+        else if(post&&action==='paste-review')result=store.pasteReview(id,await jsonBody(req));
+        else if(post&&action==='paragraph-break')result=store.paragraphBreak(id,await jsonBody(req));
         else if(get&&action==='opinion-runs')result=store.currentOpinions(id);
         else if(post&&action==='opinion-decision')result=store.decideOpinion(id,await jsonBody(req));
         else if(post&&action==='opinion-generate'){

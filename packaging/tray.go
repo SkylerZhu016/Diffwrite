@@ -95,10 +95,21 @@ type trayIcon struct {
 const (
 	wmTray        = 0x8001
 	wmWorkerDone  = 0x8002
+	wmShowMenu    = 0x8003
 	wmContextMenu = 0x007b
 	ninSelect     = 0x0400
 	ninKeySelect  = 0x0401
 )
+
+// Version 4 uses WM_CONTEXTMENU; raw mouse notifications can also arrive.
+// Opening both enters TrackPopupMenuEx recursively; its failure then restores
+// focus to the notification area and cancels the first menu.
+func isTrayMenuEvent(version4 bool, lparam uintptr) bool {
+	if version4 {
+		return uint16(lparam) == wmContextMenu
+	}
+	return uint16(lparam) == 0x0205 // WM_RBUTTONUP
+}
 
 type winRect struct{ left, top, right, bottom int32 }
 type iconIdentifier struct {
@@ -129,34 +140,8 @@ func menuAnchor(icon trayIcon, x, y int32) (int32, int32, uintptr, menuParams) {
 		x = (rect.left + rect.right) / 2
 		y = (rect.top + rect.bottom) / 2
 	}
-	// The overflow is a separate shell window, not the taskbar. Avoid the whole panel,
-	// not just the icon inside it. Normal taskbar clicks keep the single-icon exclusion.
-	packed := uintptr(uint64(uint32(x)) | uint64(uint32(y))<<32)
-	window, _, _ := user32.NewProc("WindowFromPoint").Call(packed)
-	root, _, _ := user32.NewProc("GetAncestor").Call(window, 2) // GA_ROOT
-	if root != 0 {
-		var name [96]uint16
-		count, _, _ := user32.NewProc("GetClassNameW").Call(root, uintptr(unsafe.Pointer(&name[0])), uintptr(len(name)))
-		class := syscall.UTF16ToString(name[:count])
-		var panel winRect
-		ok, _, _ := user32.NewProc("GetWindowRect").Call(root, uintptr(unsafe.Pointer(&panel)))
-		known := class == "NotifyIconOverflowWindow" || class == "TopLevelWindowForOverflowXamlIsland"
-		if !known && class != "Shell_TrayWnd" && class != "Shell_SecondaryTrayWnd" {
-			shell, _, _ := user32.NewProc("GetShellWindow").Call()
-			var owner, shellOwner uint32
-			process := user32.NewProc("GetWindowThreadProcessId")
-			process.Call(root, uintptr(unsafe.Pointer(&owner)))
-			process.Call(shell, uintptr(unsafe.Pointer(&shellOwner)))
-			// Explorer can change the overflow class across releases. A compact shell popup
-			// covering this notification icon is also an exclusion rectangle.
-			w, h := panel.right-panel.left, panel.bottom-panel.top
-			known = owner != 0 && owner == shellOwner && w >= 32 && w <= 720 && h >= 32 && h <= 720
-		}
-		if known && ok != 0 && x >= panel.left && x < panel.right && y >= panel.top && y < panel.bottom {
-			params.exclude = panel
-		}
-	}
-	flags := uintptr(0x0102 | 0x0040 | 0x10000) // return command, right button, vertical alignment, work area
+	// Exclude only the clicked icon. The native popup can overlap the overflow panel.
+	flags := uintptr(0x0102 | 0x0040) // TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_VERTICAL
 	monitor, _, _ := user32.NewProc("MonitorFromRect").Call(uintptr(unsafe.Pointer(&params.exclude)), 2)
 	info := monitorInfo{}
 	info.size = uint32(unsafe.Sizeof(info))
@@ -195,11 +180,12 @@ func runTray(url string, done <-chan struct{}) error {
 		runtime.KeepAlive(&icon)
 		return ok != 0
 	}
+	version4 := false
 	addIcon := func() bool {
 		if !sendIcon(0) {
 			return false
 		} // NIM_ADD
-		sendIcon(4) // NIM_SETVERSION
+		version4 = sendIcon(4) // NIM_SETVERSION
 		return true
 	}
 	menu, _, err := user32.NewProc("CreatePopupMenu").Call()
@@ -234,17 +220,34 @@ func runTray(url string, done <-chan struct{}) error {
 			sendIcon(3) // NIM_SETFOCUS
 		}
 	}
+	var menuPending, menuOpen bool
+	var menuPoint winPoint
+	queueMenu := func(hwnd uintptr, point winPoint) {
+		if menuPending || menuOpen {
+			return
+		}
+		menuPoint, menuPending = point, true
+		post.Call(hwnd, wmShowMenu, 0, 0)
+	}
 	className := wide("DiffwriteTray")
 	proc := syscall.NewCallback(func(hwnd, message, wparam, lparam uintptr) uintptr {
 		switch message {
+		case wmShowMenu:
+			menuPending, menuOpen = false, true
+			showMenu(hwnd, uintptr(menuPoint.x), uintptr(menuPoint.y))
+			menuOpen = false
+			return 0
 		case wmTray:
 			switch uint16(lparam) {
-			case wmContextMenu:
-				showMenu(hwnd, uintptr(int32(int16(wparam))), uintptr(int32(int16(wparam>>16))))
-			case 0x0205: // Legacy callback if setting the shell icon version failed.
-				var point winPoint
-				user32.NewProc("GetCursorPos").Call(uintptr(unsafe.Pointer(&point)))
-				showMenu(hwnd, uintptr(point.x), uintptr(point.y))
+			case wmContextMenu, 0x0205:
+				if !isTrayMenuEvent(version4, lparam) {
+					return 0
+				}
+				point := winPoint{int32(int16(wparam)), int32(int16(wparam >> 16))}
+				if !version4 {
+					user32.NewProc("GetCursorPos").Call(uintptr(unsafe.Pointer(&point)))
+				}
+				queueMenu(hwnd, point)
 			case ninSelect, ninKeySelect, 0x0203:
 				if err := openPage(url); err != nil {
 					showProblem(err)

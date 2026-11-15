@@ -42,7 +42,7 @@ function build(store,recipient){
   }),{...write,idempotentHint:true},args=>store.editDraft(args,recipient));
   add('list_review_notifications','查看作者明确要求 AI 跟进的待办；不会自动标为已处理。',z.object({limit}),readonly,
     ({limit})=>({notifications:store.listNotices(limit,recipient)}));
-  add('read_review_notification','只读取发给本连接的审稿增量：作者在你上次读写之后改动的意见、改写和删除。restored 表示恢复了原句，opinionCleared 表示意见已清空，aiOpinion / aiRevision 表示该栏仍是 AI 写的内容，gapChanges 表示段落空白的删除或恢复；可分页。',z.object({notificationId:id,offset,limit}),readonly,
+  add('read_review_notification','只读取发给本连接的审稿增量：相对上次成功通知本连接的状态，返回变动句块的当前意见、改写和删除；本连接自己的写入也计入已知状态，单纯读取不推进起点。文件导入与带注粘贴恢复的旧记录不计作新改动。restored 表示恢复了原句，opinionCleared 表示意见已清空，aiOpinion / aiRevision 表示该栏仍是 AI 写的内容，gapChanges 表示段落空白的删除或恢复；可分页。',z.object({notificationId:id,offset,limit}),readonly,
     ({notificationId,offset,limit})=>store.readNotice(notificationId,offset,limit,recipient));
   add('ack_review_notification','确认已处理指定的通知。仅在完成该项跟进后调用。',z.object({notificationId:id}),additive,
     ({notificationId})=>store.ack(notificationId,recipient));

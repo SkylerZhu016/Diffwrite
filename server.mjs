@@ -2,14 +2,15 @@ import {createServer, get} from 'node:http';
 import {readFile} from 'node:fs/promises';
 import {spawn} from 'node:child_process';
 import {makeReviewApi} from './review-api.mjs';
+import {launchConfig} from './launch-config.mjs';
 
-const host = '127.0.0.1', port = Number(process.env.DIFFWRITE_REVIEW_PORT || 41732), url = 'http://'+host+':'+port+'/';
+const host = '127.0.0.1', port = launchConfig().port, url = 'http://'+host+':'+port+'/';
 const open = process.argv.includes('--open'), managed = process.argv.includes('--managed');
 const types = new Map([
   ['/','text/html; charset=utf-8'], ['/style.css','text/css; charset=utf-8'],
-  ...['app','model','docx','markdown','history','changes','opinion-ui','vendor/markdown-parser'].map(name => ['/'+name+'.mjs','text/javascript; charset=utf-8'])
+  ...['app','inline-text','editor-text','model','docx','markdown','history','changes','opinion-ui','vendor/markdown-parser'].map(name => ['/'+name+'.mjs','text/javascript; charset=utf-8'])
 ]);
-const signature = 'diffwrite-v9';
+const signature = 'diffwrite-v19';
 const reviewApi = makeReviewApi(url.slice(0,-1));
 const server = createServer(async (req,res) => {
   const send = (status, type, content) => {

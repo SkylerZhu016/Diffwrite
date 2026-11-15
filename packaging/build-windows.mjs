@@ -15,7 +15,7 @@ const tar=join(process.env.SystemRoot||'C:/Windows','System32','tar.exe');
 const run=promisify(execFile);
 const work=await mkdtemp(join(tmpdir(),'diffwrite-pack-'));
 const payload=join(work,'payload');
-const files=['index.html','style.css','server.mjs','app.mjs','model.mjs','docx.mjs','markdown.mjs',
+const files=['index.html','style.css','server.mjs','app.mjs','inline-text.mjs','editor-text.mjs','notification-state.mjs','launch-config.mjs','model.mjs','docx.mjs','markdown.mjs',
   'changes.mjs','history.mjs','review-api.mjs','review-store.mjs','review-mcp.mjs','opinion-ai.mjs','opinion-ui.mjs','opinion-prompt.txt',
   'vendor/markdown-parser.mjs','vendor/mcp-sdk.mjs'];
 const buildId=process.version+'-'+Date.now().toString(36);
@@ -24,7 +24,7 @@ try{
   await mkdir(payload);
   await mkdir(join(work,'icon-resource'));
   await copyFile(join(here,'icon-resource','main.go'),join(work,'icon-resource','main.go'));
-  for(const name of ['main.go','tray.go','go.mod','go.sum'])await copyFile(join(here,name),join(work,name));
+  for(const name of ['main.go','tray.go','launch.go','go.mod','go.sum'])await copyFile(join(here,name),join(work,name));
   for(const name of files){
     const dest=join(payload,name);
     await mkdir(dirname(dest),{recursive:true});
